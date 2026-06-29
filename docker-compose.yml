@@ -37,8 +37,7 @@ services:
   # ── LiteLLM Smart Router + FastAPI Backend (API only) ───────
   app:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ./backend
     image: multi-llm-gateway
     ports:
       - "8000:8000"
@@ -71,7 +70,9 @@ services:
 
   # ── Open WebUI — the chat frontend ───────────────────────────
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    build:
+      context: ./frontend
+    image: lite-llm-webui
     ports:
       - "3000:8080"
     environment:

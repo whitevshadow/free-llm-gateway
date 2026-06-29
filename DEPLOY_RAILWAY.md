@@ -18,7 +18,8 @@ External clients (OpenAI SDK, Claude Code, curl, another app) →
 
 ## 1. Create the project + Postgres
 
-1. New Project → **Deploy from GitHub repo** (this repo) → it builds the `Dockerfile`
+1. New Project → **Deploy from GitHub repo** (this repo) → in the service
+   **Settings → Root Directory** set **`backend`** (it builds `backend/Dockerfile`)
    → name this service **gateway**.
 2. **+ New** → **Database** → **PostgreSQL**. Railway provisions it and exposes
    connection variables.
@@ -36,16 +37,18 @@ External clients (OpenAI SDK, Claude Code, curl, another app) →
 | `OPENROUTER_API_KEY_1` | your OpenRouter key |
 | `NVIDIA_API_KEY_1` | your NVIDIA key |
 
-**Port:** the image listens on **8000**. In the gateway service → **Settings →
-Networking → Generate Domain**, set the target port to **8000**. (Or change the
-Dockerfile start command to honor Railway's `$PORT` — see note at the bottom.)
+**Port:** `backend/Dockerfile` already honors Railway's injected `$PORT`. Just
+**Settings → Networking → Generate Domain** to get the public URL.
 
 > No bind-mount on Railway, so the model pool must come from Postgres — that's
 > why `MODEL_POOL_SOURCE=auto` + the seed step below.
 
 ## 3. open-webui service — variables
 
-**+ New → Docker Image** → `ghcr.io/open-webui/open-webui:main`. Name it **open-webui**.
+**+ New → Deploy from the same repo**, then **Settings → Root Directory** =
+**`frontend`** (builds `frontend/Dockerfile`, which wraps the Open WebUI image).
+Name it **open-webui**. *(Alternatively: + New → Docker Image →
+`ghcr.io/open-webui/open-webui:main` — same result without the folder.)*
 
 | Variable | Value |
 |---|---|
@@ -109,13 +112,8 @@ lists the live ones.
 
 ## Notes / gotchas
 
-- **`$PORT` portability (recommended):** to avoid setting the target port by hand
-  on every platform, change the Dockerfile's final line to shell form:
-  ```dockerfile
-  CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
-  ```
-  Then Railway/Render/Fly's injected `$PORT` is honored automatically; local
-  compose still uses 8000.
+- **`$PORT` portability:** already handled — `backend/Dockerfile` uses a
+  shell-form `CMD` that honors the platform-injected `$PORT` (default 8000 locally).
 - **Cooldown state** is in-memory per gateway instance — keep the gateway at **1
   replica** so the smart load-balancing/cooldown logic stays coherent.
 - **Rotate the key** by changing `GATEWAY_API_KEY` on the gateway service *and*

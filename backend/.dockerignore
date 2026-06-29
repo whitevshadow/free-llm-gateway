@@ -1,0 +1,20 @@
+# Build context = backend/. Keep secrets, caches, and local data out of the image.
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+venv/
+.venv/
+
+# Secrets & local config (provide at runtime via env vars)
+.env
+*.local
+
+# Local databases / data
+*.db
+*.sqlite
+data/
+
+# Tests not needed in the runtime image
+tests/
