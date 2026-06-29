@@ -1,0 +1,111 @@
+# ─────────────────────────────────────────────────────────────
+# Multi-LLM Gateway — full stack: PostgreSQL + API gateway + Open WebUI.
+#
+#   docker compose up -d --build
+#   → http://localhost:3000        Open WebUI   ← primary UI
+#   → http://localhost:8000        OpenAI-compatible gateway (/v1, /docs)
+#   → PostgreSQL on the internal network (service: postgres)
+#
+# Open WebUI runs in Docker and talks to the gateway over the compose network
+# at http://app:8000/v1 — no API key required (REQUIRE_GATEWAY_AUTH=false).
+# WEBUI_AUTH=false skips its login screen for local single-user use.
+#
+# One-off maintenance (run manually, inside the app container):
+#   docker compose exec app python -m app.scripts.migrate_sqlite_to_postgres
+#   docker compose exec app python -m app.scripts.probe_models
+# ─────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL — primary application database ────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=gateway
+      - POSTGRES_PASSWORD=gateway
+      - POSTGRES_DB=gateway
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── LiteLLM Smart Router + FastAPI Backend (API only) ───────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: multi-llm-gateway
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      # Primary DB is now PostgreSQL. `postgres` resolves on the compose network.
+      - DATABASE_URL=postgresql+psycopg2://gateway:gateway@postgres:5432/gateway
+      # Gateway auth for the public /v1 API. Values come from the root .env so the
+      # same key is shared with Open WebUI below.
+      - REQUIRE_GATEWAY_AUTH=${REQUIRE_GATEWAY_AUTH:-true}
+      - GATEWAY_API_KEY=${GATEWAY_API_KEY}
+    volumes:
+      # Keep the old SQLite volume mounted so its data can be migrated across.
+      - app_data:/app/data
+      # Live-mount the model pool so YAML tweaks apply on a router reload (no rebuild).
+      - ./backend/config:/app/config:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── Open WebUI — the chat frontend ───────────────────────────
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports:
+      - "3000:8080"
+    environment:
+      # Reach the gateway over the compose network (service name `app`).
+      - OPENAI_API_BASE_URL=http://app:8000/v1
+      # Present the SAME gateway key the external API requires (from root .env).
+      - OPENAI_API_KEY=${GATEWAY_API_KEY}
+      # Require login. The FIRST account created on the sign-up screen becomes
+      # the admin (you set your own email + password there).
+      - WEBUI_AUTH=true
+      # Allow account creation so you can make that first admin account. After
+      # you've created it, flip this to false to stop anyone else signing up.
+      - ENABLE_SIGNUP=true
+      # We only use the OpenAI-compatible gateway, not Ollama.
+      - ENABLE_OLLAMA_API=false
+      - WEBUI_NAME=Lite-LLM
+      # Default models = the 4 reliability-core models (each backed by all 3 providers).
+      - DEFAULT_MODELS=gpt-oss-120b,llama-3.3-70b,gpt-oss-20b,llama-3.1-8b
+    volumes:
+      - open_webui_data:/app/backend/data
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    # Override the image's built-in healthcheck (its jq pipe errors on this build
+    # and falsely reports "unhealthy"). A plain HTTP 200 check is enough.
+    healthcheck:
+      test: ["CMD-SHELL", "curl --silent --fail http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  app_data:
+  pg_data:
+  open_webui_data:

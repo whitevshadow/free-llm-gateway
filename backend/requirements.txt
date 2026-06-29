@@ -1,0 +1,42 @@
+# ──────────────────────────────────────────────
+# Multi-LLM Gateway Platform — Backend Dependencies
+# ──────────────────────────────────────────────
+
+# Web Framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# LLM Abstraction Layer (Router: load balancing, cooldowns, fallbacks)
+litellm>=1.83.0
+
+# YAML parsing for the free-provider model pool
+pyyaml>=6.0
+
+# Database ORM & Migrations
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+# PostgreSQL driver (primary database). Ships prebuilt wheels — no compiler needed.
+psycopg2-binary>=2.9.9
+
+# Configuration & Validation
+pydantic>=2.6.0
+pydantic[email]>=2.6.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.0
+
+# Security & Authentication
+python-jose[cryptography]>=3.3.0
+# NOTE: passlib 1.7.4 is incompatible with bcrypt >= 4.1 (its backend self-test
+# hashes a >72-byte probe that newer bcrypt rejects). Pin bcrypt below 4.1.
+passlib[bcrypt]>=1.7.4
+bcrypt>=4.0,<4.1
+python-multipart>=0.0.9
+
+# HTTP Client (used by LiteLLM internally, and for testing)
+httpx>=0.27.0
+
+# Rate Limiting
+slowapi>=0.1.9
+
+# Logging (structured JSON logs)
+python-json-logger>=2.0.7

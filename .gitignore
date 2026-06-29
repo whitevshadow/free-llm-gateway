@@ -1,0 +1,51 @@
+# System Files
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.env
+.pytest_cache/
+.ruff_cache/
+*.db
+*.sqlite
+
+# NodeJS / Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+.eslintcache
+
+# Development/Local configurations
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDEs and editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Secrets & local runtime state (NEVER commit)
+.env
+.webui_secret_key
+
+# Open WebUI local install + data (run via Docker instead)
+.openwebui-venv/
+.openwebui-data/
+
+# Claude Code tooling / skills (not part of the app)
+.claude/
+.agents/
+skills-lock.json
