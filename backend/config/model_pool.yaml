@@ -50,6 +50,10 @@ model_list:
     litellm_params:
       model: gemini/gemini-2.5-flash
       api_key: os.environ/GEMINI_API_KEY_1
+  - model_name: auto
+    litellm_params:
+      model: cerebras/gpt-oss-120b
+      api_key: os.environ/CEREBRAS_API_KEY_1
 
   # ════════════════════════════════════════════════════════════════════════
   # gpt-oss-120b  — OpenAI open weights.  Groq + NVIDIA + OpenRouter
@@ -72,6 +76,10 @@ model_list:
       model: groq/openai/gpt-oss-120b
       api_key: os.environ/GROQ_API_KEY_2
       rpm: 30
+  - model_name: gpt-oss-120b
+    litellm_params:
+      model: cerebras/gpt-oss-120b
+      api_key: os.environ/CEREBRAS_API_KEY_1
 
   # ════════════════════════════════════════════════════════════════════════
   # gpt-oss-20b  — smaller/faster OpenAI open weights.  Groq + NVIDIA + OpenRouter
@@ -142,7 +150,12 @@ model_list:
   # ════════════════════════════════════════════════════════════════════════
   # SECONDARY MODELS — handy extras; also serve as fallback targets.
   # ════════════════════════════════════════════════════════════════════════
-  # deepseek  — DeepSeek R1 across free routes
+  # deepseek  — DeepSeek across free routes. NVIDIA (deepseek-v4) is the only
+  # route that reliably answers today; Groq/OpenRouter/direct back it up.
+  - model_name: deepseek
+    litellm_params:
+      model: nvidia_nim/deepseek-ai/deepseek-v4-flash
+      api_key: os.environ/NVIDIA_API_KEY_1
   - model_name: deepseek
     litellm_params:
       model: groq/deepseek-r1-distill-llama-70b
@@ -172,6 +185,20 @@ model_list:
       model: openrouter/qwen/qwen3-235b-a22b:free
       api_key: os.environ/OPENROUTER_API_KEY_1
 
+  # mistral  — Mistral family via NVIDIA NIM (large → medium → small).
+  - model_name: mistral
+    litellm_params:
+      model: nvidia_nim/mistralai/mistral-large-3-675b-instruct-2512
+      api_key: os.environ/NVIDIA_API_KEY_1
+  - model_name: mistral
+    litellm_params:
+      model: nvidia_nim/mistralai/mistral-medium-3.5-128b
+      api_key: os.environ/NVIDIA_API_KEY_1
+  - model_name: mistral
+    litellm_params:
+      model: nvidia_nim/mistralai/mistral-small-4-119b-2603
+      api_key: os.environ/NVIDIA_API_KEY_1
+
   # gemini-flash  — Google AI Studio free tier (activates when GEMINI key set)
   - model_name: gemini-flash
     litellm_params:
@@ -187,6 +214,80 @@ model_list:
     litellm_params:
       model: ollama/llama3
       api_base: os.environ/OLLAMA_API_BASE
+
+  # ════════════════════════════════════════════════════════════════════════
+  # EMBEDDINGS — NVIDIA NIM free endpoints, served via POST /v1/embeddings.
+  #
+  # NVIDIA's retrieval models are ASYMMETRIC: they require an `input_type` of
+  # "query" or "passage". We default to "query" here so plain OpenAI clients
+  # work out of the box; when embedding documents for an index, pass
+  # `"input_type": "passage"` in the request body to override.
+  #
+  # Embedding models are NOT interchangeable (different dimensions / vector
+  # spaces), so each gets its own virtual name and NO cross-model fallbacks.
+  # `embed` is the default the /v1/embeddings endpoint falls back to.
+  # ════════════════════════════════════════════════════════════════════════
+  # embed — DEFAULT. Multilingual long-document QA retrieval (26 languages).
+  - model_name: embed
+    litellm_params:
+      model: nvidia_nim/nvidia/llama-nemotron-embed-1b-v2
+      api_key: os.environ/NVIDIA_API_KEY_1
+      encoding_format: float
+      input_type: query
+    model_info:
+      mode: embedding
+
+  # nemotron-embed — same model as `embed`, under its explicit name.
+  - model_name: nemotron-embed
+    litellm_params:
+      model: nvidia_nim/nvidia/llama-nemotron-embed-1b-v2
+      api_key: os.environ/NVIDIA_API_KEY_1
+      encoding_format: float
+      input_type: query
+    model_info:
+      mode: embedding
+
+  # nemotron-embed-vl — multimodal QA retrieval (text queries ↔ doc images).
+  - model_name: nemotron-embed-vl
+    litellm_params:
+      model: nvidia_nim/nvidia/llama-nemotron-embed-vl-1b-v2
+      api_key: os.environ/NVIDIA_API_KEY_1
+      encoding_format: float
+      input_type: query
+    model_info:
+      mode: embedding
+
+  # nv-embedqa-e5-v5 — English QA retrieval, 1024-dim.
+  - model_name: nv-embedqa-e5-v5
+    litellm_params:
+      model: nvidia_nim/nvidia/nv-embedqa-e5-v5
+      api_key: os.environ/NVIDIA_API_KEY_1
+      encoding_format: float
+      input_type: query
+    model_info:
+      mode: embedding
+
+  # nv-embed-v1 — general-purpose text embeddings (symmetric, no input_type;
+  # non-commercial license).
+  - model_name: nv-embed-v1
+    litellm_params:
+      model: nvidia_nim/nvidia/nv-embed-v1
+      api_key: os.environ/NVIDIA_API_KEY_1
+      encoding_format: float
+    model_info:
+      mode: embedding
+
+  # bge-m3 — BAAI multilingual dense retrieval, 1024-dim.
+  # NOTE: NVIDIA's hosted bge-m3 currently returns errors for every request
+  # (as of 2026-07); kept here so it activates when NVIDIA fixes the endpoint.
+  - model_name: bge-m3
+    litellm_params:
+      model: nvidia_nim/baai/bge-m3
+      api_key: os.environ/NVIDIA_API_KEY_1
+      encoding_format: float
+      input_type: query
+    model_info:
+      mode: embedding
 
 # ──────────────────────────────────────────────────────────────────────────
 # Router behaviour. These map to litellm.Router(**router_settings).
@@ -206,6 +307,7 @@ router_settings:
     - {"gpt-oss-20b": ["llama-3.1-8b", "llama-3.3-70b", "gpt-oss-120b", "qwen", "gemini-flash"]}
     - {"llama-3.3-70b": ["gpt-oss-120b", "llama-3.1-8b", "gpt-oss-20b", "qwen", "gemini-flash"]}
     - {"llama-3.1-8b": ["llama-3.3-70b", "gpt-oss-20b", "gpt-oss-120b", "qwen", "gemini-flash"]}
-    - {"deepseek": ["llama-3.3-70b", "qwen", "gpt-oss-120b", "gemini-flash"]}
+    - {"deepseek": ["qwen", "llama-3.3-70b", "gpt-oss-120b", "gemini-flash"]}
+    - {"mistral": ["llama-3.3-70b", "qwen", "gpt-oss-120b", "gemini-flash"]}
     - {"qwen": ["llama-3.3-70b", "gpt-oss-120b", "gemini-flash"]}
     - {"gemini-flash": ["llama-3.3-70b", "gpt-oss-120b"]}

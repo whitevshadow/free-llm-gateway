@@ -486,14 +486,22 @@ def all_probe_targets() -> List[Dict[str, Any]]:
     Enumerate EVERY deployment (pool + NVIDIA auto-discovered) for the manual
     availability probe — unfiltered, with resolved keys and the env-var name.
 
-    Each dict: {virtual_model, model, api_key, api_base, api_key_var, provider}.
+    Each dict: {virtual_model, model, api_key, api_base, api_key_var, provider,
+    mode, extra_params}. `mode` comes from the pool entry's model_info (default
+    "chat") so the probe knows to ping embeddings with an embedding call, and
+    `extra_params` carries required provider params (e.g. NVIDIA's input_type).
     Deployments whose key env-var is unset are skipped (nothing to test).
     """
     pool = _load_pool()
     raw_list = pool.get("model_list", []) or []
     targets: List[Dict[str, Any]] = []
 
-    def _add(virtual: str, params: Dict[str, Any], api_key_var: Optional[str]) -> None:
+    def _add(
+        virtual: str,
+        params: Dict[str, Any],
+        api_key_var: Optional[str],
+        mode: str = "chat",
+    ) -> None:
         model = params.get("model", "")
         if not model:
             return
@@ -505,12 +513,18 @@ def all_probe_targets() -> List[Dict[str, Any]]:
                 "api_base": params.get("api_base"),
                 "api_key_var": api_key_var,
                 "provider": model.split("/", 1)[0] if model else "unknown",
+                "mode": mode,
+                "extra_params": {
+                    k: v for k, v in params.items()
+                    if k not in ("model", "api_key", "api_base", "rpm")
+                },
             }
         )
 
     for entry in raw_list:
         params = dict(entry.get("litellm_params", {}) or {})
         virtual = entry.get("model_name", "")
+        mode = (entry.get("model_info") or {}).get("mode") or "chat"
 
         base = params.get("api_base")
         if isinstance(base, str) and base.startswith(_ENV_PREFIX):
@@ -525,7 +539,7 @@ def all_probe_targets() -> List[Dict[str, Any]]:
                 continue  # key not configured — nothing to probe
             params["api_key"] = resolved
 
-        _add(virtual, params, api_key_var)
+        _add(virtual, params, api_key_var, mode)
 
     # NVIDIA + OpenRouter auto-discovered models (each maps to one deployment).
     existing = {e.get("model_name") for e in raw_list}

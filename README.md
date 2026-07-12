@@ -59,11 +59,24 @@ client.chat.completions.create(
 |---|---|
 | `POST /v1/messages` | Anthropic-compatible (Claude Code) |
 | `POST /v1/chat/completions` | OpenAI-compatible (any OpenAI client) |
+| `POST /v1/embeddings` | OpenAI-compatible embeddings (NVIDIA NIM free tier) |
 | `GET  /v1/models` | List the live virtual models |
 | `GET  /health` | Status + router pool size + cooldowns |
 
 `/v1` auth is **open by default** for local dev; set `REQUIRE_GATEWAY_AUTH=true` and
 `GATEWAY_API_KEY=...` to require `Authorization: Bearer <token>` or `x-api-key`.
+
+Embedding models (free via NVIDIA NIM): `embed` (default — llama-nemotron-embed-1b-v2,
+multilingual), `nemotron-embed-vl` (multimodal), `nv-embedqa-e5-v5` (English QA),
+`nv-embed-v1` (general, non-commercial), `bge-m3`. Unknown embedding model names map
+to `embed`. NVIDIA's retrieval models are asymmetric — requests default to
+`input_type: "query"`; add `"input_type": "passage"` to the body when embedding
+documents for an index:
+
+```python
+client.embeddings.create(model="embed", input=["hello world"])                        # query side
+client.embeddings.create(model="embed", input=chunks, extra_body={"input_type": "passage"})  # index side
+```
 
 > The original JWT-gated chat UI and analytics (`/api/v1/...`) still work and now run
 > through the same smart Router. Note: `passlib` 1.7.4 needs `bcrypt < 4.1` (pinned in

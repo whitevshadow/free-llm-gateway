@@ -72,27 +72,37 @@ def _classify(exc: Exception) -> Tuple[bool, str, Optional[int]]:
 
 
 async def _ping(sem: asyncio.Semaphore, target: Dict[str, Any]) -> Dict[str, Any]:
-    """Send one 1-token completion and return a normalised result dict."""
+    """Send one minimal request (chat or embedding) and return a result dict."""
     model = target["model"]
+    is_embedding = target.get("mode") == "embedding"
     kwargs: Dict[str, Any] = {
         "model": model,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
         "num_retries": 0,
         "timeout": PING_TIMEOUT,
+        # Required provider params from the pool (e.g. NVIDIA embeddings need
+        # input_type + encoding_format).
+        **(target.get("extra_params") or {}),
     }
+    if is_embedding:
+        kwargs["input"] = ["ping"]
+    else:
+        kwargs["messages"] = [{"role": "user", "content": "ping"}]
+        kwargs["max_tokens"] = 1
     if target.get("api_key"):
         kwargs["api_key"] = target["api_key"]
     if target.get("api_base"):
         kwargs["api_base"] = target["api_base"]
     # DeepSeek reasoning models "think" first; disable it so the ping is snappy.
-    if "deepseek" in model.lower():
+    if not is_embedding and "deepseek" in model.lower():
         kwargs["extra_body"] = {"chat_template_kwargs": {"thinking": False}}
 
     async with sem:
         start = time.perf_counter()
         try:
-            await litellm.acompletion(**kwargs)
+            if is_embedding:
+                await litellm.aembedding(**kwargs)
+            else:
+                await litellm.acompletion(**kwargs)
             latency = int((time.perf_counter() - start) * 1000)
             return {
                 "model": model, "available": True, "status": "available",

@@ -15,6 +15,6 @@ ENV PORT=7860 \
     ENABLE_SIGNUP=true \
     ENABLE_OLLAMA_API=false \
     WEBUI_NAME=Lite-LLM \
-    DEFAULT_MODELS=gpt-oss-120b,llama-3.3-70b,gpt-oss-20b,llama-3.1-8b
+    DEFAULT_MODELS=gpt-oss-120b,llama-3.3-70bs
 
 EXPOSE 7860
