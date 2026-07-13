@@ -1,19 +1,20 @@
 """
-Gateway auth — lightweight token check for the /v1 compatibility endpoints.
+Gateway auth — token check for the /v1 compatibility endpoints.
 
-WHY SEPARATE FROM THE JWT:
-  The UI routes (/api/v1/...) authenticate users with a JWT. The /v1 endpoints,
-  by contrast, are consumed by *software* — Claude Code, the OpenAI SDK, curl,
-  Cursor, etc. Those clients present a single static token, the way they would to
-  OpenAI or Anthropic. This module validates that token.
+The /v1 endpoints are consumed by software (Claude Code, the OpenAI SDK, curl,
+Cursor). Those clients present a single bearer token, the way they would to
+OpenAI or Anthropic. This module validates that token against the DB-issued
+gateway keys (hashed in `gateway_api_keys`).
 
 HOW CLIENTS SEND IT:
   • OpenAI style    →  Authorization: Bearer <token>
   • Anthropic style →  x-api-key: <token>
 
 BEHAVIOUR:
-  • REQUIRE_GATEWAY_AUTH = False (default, local dev) → allow everything.
-  • REQUIRE_GATEWAY_AUTH = True  → the presented token must equal GATEWAY_API_KEY.
+  • REQUIRE_GATEWAY_AUTH = False → allow everything (local dev).
+  • REQUIRE_GATEWAY_AUTH = True (default) → the presented token must hash to an
+    active row in gateway_api_keys. Mint one via /v1/admin/gateway-keys; a
+    bootstrap key is minted + logged on first startup.
 """
 
 from typing import Optional
@@ -21,6 +22,8 @@ from typing import Optional
 from fastapi import Header, HTTPException, status
 
 from app.core.config import settings
+from app.core.database import SessionLocal
+from app.services import gateway_keys
 
 
 def _extract_token(authorization: Optional[str], x_api_key: Optional[str]) -> Optional[str]:
@@ -38,21 +41,27 @@ async def verify_gateway_key(
     authorization: Optional[str] = Header(default=None),
     x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
 ) -> None:
-    """FastAPI dependency: enforce the gateway token when auth is required."""
+    """FastAPI dependency: enforce a valid DB-issued gateway key when required."""
     if not settings.REQUIRE_GATEWAY_AUTH:
         return
 
-    if not settings.GATEWAY_API_KEY:
-        # Misconfiguration: auth required but no key set. Fail closed.
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Gateway auth is enabled but GATEWAY_API_KEY is not set.",
-        )
-
     token = _extract_token(authorization, x_api_key)
-    if token != settings.GATEWAY_API_KEY:
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key.",
+            detail="Missing API key.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    db = SessionLocal()
+    try:
+        row = gateway_keys.verify(db, token)
+    finally:
+        db.close()
+
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or revoked API key.",
             headers={"WWW-Authenticate": "Bearer"},
         )

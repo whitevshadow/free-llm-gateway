@@ -41,6 +41,17 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 hours
 
+    # Fernet key for encrypting provider secrets at rest. If unset, a key is
+    # derived from SECRET_KEY (dev convenience) and a warning is logged — set a
+    # dedicated ENCRYPTION_KEY in production so rotating SECRET_KEY can't brick
+    # stored provider keys. Generate one: `python -c "from cryptography.fernet
+    # import Fernet; print(Fernet.generate_key().decode())"`.
+    ENCRYPTION_KEY: Optional[str] = None
+
+    # The single gateway owner. A bootstrap user + gateway key are created on
+    # first startup (the key is logged once) so the admin API is reachable.
+    OWNER_EMAIL: str = "owner@localhost"
+
     # ── CORS ────────────────────────────────────────────
     # Comma-separated origins for CORS. "*" allows everything (dev only).
     CORS_ORIGINS: str = "*"
@@ -68,6 +79,11 @@ class Settings(BaseSettings):
     #   yaml → always use the YAML file (ignore the DB tables)
     # Seed the DB from the YAML once with: python -m app.scripts.seed_pool_from_yaml
     MODEL_POOL_SOURCE: str = "auto"
+    # Where the live Router gets its model list:
+    #   yaml → the YAML bootstrap pool (default, pre-cutover)
+    #   db   → the common-model spine (common_model → members → deployments)
+    # Flip to "db" once the discovery/probe/derive pipeline has been run.
+    ROUTER_SOURCE: str = "yaml"
     # When an Anthropic/OpenAI client requests a model we don't recognise as a
     # virtual model (e.g. Claude Code sends "claude-3-5-sonnet"), route it here.
     DEFAULT_VIRTUAL_MODEL: str = "auto"
@@ -86,10 +102,13 @@ class Settings(BaseSettings):
     FILTER_BY_AVAILABILITY: bool = True
 
     # ── Gateway Auth (for /v1 compatibility endpoints) ──
-    # The token external software (Claude Code, OpenAI SDK clients) must present.
-    # Distinct from the JWT used by the UI routes. Open by default for local dev.
+    # /v1 auth is now DB-issued keys only: clients present a token that must hash
+    # to an active row in `gateway_api_keys` (mint via /v1/admin/gateway-keys).
+    # Secure by default — set REQUIRE_GATEWAY_AUTH=false to open /v1 for local dev.
+    # GATEWAY_API_KEY is retained only for backward-compat env parsing; it is NOT
+    # accepted as a credential anymore.
     GATEWAY_API_KEY: Optional[str] = None
-    REQUIRE_GATEWAY_AUTH: bool = False
+    REQUIRE_GATEWAY_AUTH: bool = True
 
     # ── Provider API Keys ───────────────────────────────
     # Numbered free keys (GROQ_API_KEY_1, GROQ_API_KEY_2, ...) are read directly

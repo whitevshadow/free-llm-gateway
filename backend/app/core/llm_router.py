@@ -86,59 +86,13 @@ def _load_pool_from_yaml() -> Dict[str, Any]:
 
 def _load_pool_from_db() -> Optional[Dict[str, Any]]:
     """
-    Build the pool dict from the Postgres tables (model_deployments + router_config).
+    DB-backed model list (legacy model_deployments) was removed in the single-model
+    consolidation. The DB-driven pool is rebuilt from the common-model spine
+    (provider_models → master_model → deployments → common_model) in Phase 6.
 
-    Returns None if there are no deployments (so callers can fall back to YAML) or
-    if the DB is unreachable. The returned shape is identical to the YAML's:
-    {"model_list": [...], "router_settings": {...}}.
+    Until then this returns None so `_load_pool` falls back to the YAML bootstrap.
     """
-    try:
-        from app.core.database import SessionLocal
-        from app.models.model_pool import ModelDeployment, RouterConfig
-
-        db = SessionLocal()
-        try:
-            deps = (
-                db.query(ModelDeployment)
-                .filter(ModelDeployment.enabled.is_(True))
-                .order_by(ModelDeployment.id)
-                .all()
-            )
-            if not deps:
-                return None
-
-            model_list: List[Dict[str, Any]] = []
-            for d in deps:
-                params: Dict[str, Any] = {"model": d.litellm_model}
-                if d.api_key_ref:
-                    params["api_key"] = d.api_key_ref
-                if d.api_base_ref:
-                    params["api_base"] = d.api_base_ref
-                if d.rpm is not None:
-                    params["rpm"] = d.rpm
-                if d.extra:
-                    params.update(d.extra)
-                model_list.append({"model_name": d.model_name, "litellm_params": params})
-
-            router_settings: Dict[str, Any] = {}
-            rc = db.query(RouterConfig).first()
-            if rc:
-                for key, val in (
-                    ("routing_strategy", rc.routing_strategy),
-                    ("num_retries", rc.num_retries),
-                    ("cooldown_time", rc.cooldown_time),
-                    ("allowed_fails", rc.allowed_fails),
-                    ("fallbacks", rc.fallbacks),
-                ):
-                    if val is not None:
-                        router_settings[key] = val
-
-            return {"model_list": model_list, "router_settings": router_settings}
-        finally:
-            db.close()
-    except Exception as exc:  # table missing, DB down, etc.
-        logger.warning("Could not load pool from DB (%s); falling back to YAML.", exc)
-        return None
+    return None
 
 
 def _load_pool() -> Dict[str, Any]:
@@ -362,35 +316,109 @@ def _openrouter_discovered_deployments(existing_names: set) -> List[Dict[str, An
 # ROUTER CONSTRUCTION
 # ───────────────────────────────────────────────────────────────
 
+def _build_from_db() -> Optional[Dict[str, Any]]:
+    """
+    Build the pool from the common-model spine (Phase 6).
+
+    For each active common_model, register every WORKING per-key deployment of its
+    members. The priority-0 member's deployments share the common name (Level-1
+    per-key load balancing); higher-priority members go under `<name>##fbN` names
+    referenced by an ordered fallbacks list (Level-2 cross-provider cascade).
+
+    Returns {"model_list", "router_settings"} or None if the spine is empty.
+    """
+    try:
+        from app.core.database import SessionLocal
+        from app.models.common_model import CommonModel, CommonModelMember
+        from app.models.deployment import Deployment
+        from app.models.provider_api_key import ProviderApiKey
+        from app.models.model_pool import RouterConfig
+    except Exception as exc:  # pragma: no cover
+        logger.warning("DB router source unavailable (%s).", exc)
+        return None
+
+    db = SessionLocal()
+    try:
+        commons = db.query(CommonModel).filter(CommonModel.is_active.is_(True)).all()
+        if not commons:
+            return None
+
+        model_list: List[Dict[str, Any]] = []
+        fallbacks: List[Dict[str, Any]] = []
+        key_slot = {k.id: k.env_slot for k in db.query(ProviderApiKey).all()}
+
+        for cm in commons:
+            members = (
+                db.query(CommonModelMember)
+                .filter(CommonModelMember.common_model_id == cm.id)
+                .order_by(CommonModelMember.priority)
+                .all()
+            )
+            fb_names: List[str] = []
+            for member in members:
+                name = cm.name if member.priority == 0 else f"{cm.name}##fb{member.priority}"
+                deps = (
+                    db.query(Deployment)
+                    .filter(Deployment.master_model_id == member.master_model_id,
+                            Deployment.is_working.is_(True))
+                    .all()
+                )
+                if not deps:
+                    continue
+                if member.priority > 0:
+                    fb_names.append(name)
+                for d in deps:
+                    params: Dict[str, Any] = {"model": d.litellm_model}
+                    slot = key_slot.get(d.provider_key_id)
+                    if slot:
+                        params["api_key"] = f"{_ENV_PREFIX}{slot}"
+                    model_list.append({"model_name": name, "litellm_params": params})
+            if fb_names:
+                fallbacks.append({cm.name: fb_names})
+
+        rc = db.query(RouterConfig).first()
+        router_settings: Dict[str, Any] = {"fallbacks": fallbacks}
+        if rc:
+            for k, v in (("routing_strategy", rc.routing_strategy), ("num_retries", rc.num_retries),
+                         ("cooldown_time", rc.cooldown_time), ("allowed_fails", rc.allowed_fails)):
+                if v is not None:
+                    router_settings[k] = v
+        return {"model_list": model_list, "router_settings": router_settings}
+    finally:
+        db.close()
+
+
 def _build_router() -> Router:
     global _virtual_models
 
-    pool = _load_pool()
-    raw_list = pool.get("model_list", []) or []
-    router_settings = dict(pool.get("router_settings", {}) or {})
+    use_db = (settings.ROUTER_SOURCE or "yaml").lower() == "db"
+    db_pool = _build_from_db() if use_db else None
 
-    model_list = _build_model_list(raw_list)
+    if db_pool is not None:
+        raw_list = db_pool.get("model_list", []) or []
+        router_settings = dict(db_pool.get("router_settings", {}) or {})
+        model_list = _build_model_list(raw_list)  # resolve os.environ/<slot>, drop unset
+    else:
+        if use_db:
+            logger.warning("ROUTER_SOURCE=db but the common-model spine is empty; using YAML.")
+        pool = _load_pool()
+        raw_list = pool.get("model_list", []) or []
+        router_settings = dict(pool.get("router_settings", {}) or {})
+        model_list = _build_model_list(raw_list)
 
-    # Auto-discover every NVIDIA chat model and register it by its full id.
-    model_list.extend(_nvidia_discovered_deployments({d["model_name"] for d in model_list}))
-    # Auto-discover every OpenRouter model and register it by its full id.
-    model_list.extend(_openrouter_discovered_deployments({d["model_name"] for d in model_list}))
+        # Auto-discover every NVIDIA chat model and register it by its full id.
+        model_list.extend(_nvidia_discovered_deployments({d["model_name"] for d in model_list}))
+        # Auto-discover every OpenRouter model and register it by its full id.
+        model_list.extend(_openrouter_discovered_deployments({d["model_name"] for d in model_list}))
 
-    # Hide deployments a manual probe marked unavailable. No effect until a probe
-    # has populated the model_availability table (see app/scripts/probe_models.py).
-    if settings.FILTER_BY_AVAILABILITY:
-        unavailable = get_unavailable_concrete_models()
-        if unavailable:
-            before = len(model_list)
-            model_list = [
-                d for d in model_list
-                if (d.get("litellm_params", {}) or {}).get("model") not in unavailable
-            ]
-            dropped = before - len(model_list)
-            if dropped:
-                logger.info(
-                    "Availability filter: hid %d deployment(s) marked unavailable.", dropped
-                )
+        # Hide deployments a manual probe marked unavailable (legacy YAML path).
+        if settings.FILTER_BY_AVAILABILITY:
+            unavailable = get_unavailable_concrete_models()
+            if unavailable:
+                model_list = [
+                    d for d in model_list
+                    if (d.get("litellm_params", {}) or {}).get("model") not in unavailable
+                ]
 
     if not model_list:
         logger.warning(
@@ -422,7 +450,8 @@ def _build_router() -> Router:
         **router_settings,
     )
 
-    _virtual_models = sorted(live_names)
+    # Exclude internal fallback sub-names (`<name>##fbN`) from the public list.
+    _virtual_models = sorted(n for n in live_names if "##fb" not in n)
     logger.info(
         "Router built: %d deployment(s) across %d virtual model(s): %s",
         len(model_list),
@@ -459,26 +488,14 @@ def list_virtual_models() -> List[str]:
 
 def get_unavailable_concrete_models() -> set:
     """
-    Concrete model strings a manual probe marked unavailable.
+    Concrete model strings to hide from the pool.
 
-    Returns an empty set if no probe has run yet (table empty/missing) or the DB
-    is unreachable — so filtering is a no-op until there's real data to act on.
+    The legacy model_availability table was removed in the single-model
+    consolidation; per-key availability now lives in the `deployments` table and
+    is applied by the Phase 6 DB-driven builder. Returns an empty set here so the
+    YAML bootstrap path applies no availability filtering.
     """
-    try:
-        from app.core.database import SessionLocal
-        from app.models.model_availability import ModelAvailability
-
-        db = SessionLocal()
-        try:
-            rows = db.query(
-                ModelAvailability.concrete_model, ModelAvailability.available
-            ).all()
-            return {row[0] for row in rows if not row[1]}
-        finally:
-            db.close()
-    except Exception as exc:  # table not created yet, DB down, etc.
-        logger.debug("Availability table not queryable (%s) — skipping filter.", exc)
-        return set()
+    return set()
 
 
 def all_probe_targets() -> List[Dict[str, Any]]:

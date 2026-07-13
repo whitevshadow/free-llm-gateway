@@ -82,8 +82,16 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error(f"Database initialisation failed: {exc}")
 
-    # Inject any keys configured via the Settings UI into the environment BEFORE
-    # the Router is built, so persisted keys activate their deployments.
+    # Ensure the owner user + a gateway key exist so the admin API is reachable
+    # on a fresh DB (the bootstrap key is logged once).
+    try:
+        from app.services.bootstrap import ensure_owner_and_bootstrap_key
+        ensure_owner_and_bootstrap_key()
+    except Exception as exc:
+        logger.error(f"Bootstrap failed: {exc}")
+
+    # Decrypt persisted provider keys into the environment BEFORE the Router is
+    # built, so they activate their deployments.
     try:
         from app.services.key_store import apply_persisted_keys
         apply_persisted_keys()

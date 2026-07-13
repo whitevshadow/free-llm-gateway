@@ -21,13 +21,13 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-# Override database BEFORE importing the app
+# Override settings BEFORE importing the app (os env wins over .env).
 os.environ["DATABASE_URL"] = "sqlite:///./test_gateway.db"
+# Pin auth ON so the gateway-key tests are deterministic regardless of .env.
+os.environ["REQUIRE_GATEWAY_AUTH"] = "true"
 
 from app.main import app
 from app.core.database import Base, get_db
-from app.core.security import get_password_hash, create_access_token
-from app.models.user import User
 
 # ── Test Database Setup ─────────────────────────────────
 TEST_DATABASE_URL = "sqlite:///./test_gateway.db"
@@ -62,33 +62,13 @@ def setup_database():
 
 
 @pytest.fixture(scope="session")
-def test_user():
-    """Create a test user in the database and return their data."""
-    db = TestSessionLocal()
-    user = db.query(User).filter(User.email == "test@gateway.io").first()
-    if not user:
-        user = User(
-            email="test@gateway.io",
-            hashed_password=get_password_hash("testpassword123"),
-            full_name="Test User",
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    db.close()
-    return {"id": user.id, "email": user.email}
-
-
-@pytest.fixture(scope="session")
-def auth_token(test_user):
-    """Generate a valid JWT for the test user."""
-    return create_access_token(subject=test_user["email"])
-
-
-@pytest.fixture(scope="session")
-def client(auth_token):
+def client():
     """
-    A TestClient with a valid Authorization header pre-set.
+    A plain TestClient for the gateway.
+
+    The native-UI JWT auth was removed in the single-model consolidation; the /v1
+    endpoints use a gateway API key (open by default in tests, since
+    REQUIRE_GATEWAY_AUTH defaults to False).
 
     Usage in tests:
       def test_something(client):
@@ -96,5 +76,4 @@ def client(auth_token):
           assert response.status_code == 200
     """
     with TestClient(app) as c:
-        c.headers["Authorization"] = f"Bearer {auth_token}"
         yield c

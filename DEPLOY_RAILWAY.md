@@ -1,14 +1,12 @@
 # Deploying to Railway — gateway as a public API for external clients
 
-This stack becomes **one Railway project with three services**. External clients
-call the **gateway**'s public URL; Open WebUI reaches it over Railway's private
-network.
+This stack becomes **one Railway project with two services**. External clients
+call the **gateway**'s public URL.
 
 ```
 Project: lite-llm
 ├── Postgres     (Railway plugin)            → internal DATABASE_URL
-├── gateway      (this repo's Dockerfile)    → PUBLIC https://gateway-xxx.up.railway.app/v1
-└── open-webui   (ghcr.io/open-webui/...)    → PUBLIC https://chat-xxx.up.railway.app
+└── gateway      (this repo's Dockerfile)    → PUBLIC https://gateway-xxx.up.railway.app/v1
 ```
 
 External clients (OpenAI SDK, Claude Code, curl, another app) →
@@ -43,27 +41,7 @@ External clients (OpenAI SDK, Claude Code, curl, another app) →
 > No bind-mount on Railway, so the model pool must come from Postgres — that's
 > why `MODEL_POOL_SOURCE=auto` + the seed step below.
 
-## 3. open-webui service — variables
-
-**+ New → Deploy from the same repo**, then **Settings → Root Directory** =
-**`frontend`** (builds `frontend/Dockerfile`, which wraps the Open WebUI image).
-Name it **open-webui**. *(Alternatively: + New → Docker Image →
-`ghcr.io/open-webui/open-webui:main` — same result without the folder.)*
-
-| Variable | Value |
-|---|---|
-| `OPENAI_API_BASE_URL` | `http://gateway.railway.internal:8000/v1` (private network) |
-| `OPENAI_API_KEY` | the **same** `GATEWAY_API_KEY` |
-| `WEBUI_AUTH` | `true` |
-| `ENABLE_SIGNUP` | `true` (flip to `false` after you make your admin account) |
-| `ENABLE_OLLAMA_API` | `false` |
-| `WEBUI_NAME` | `Lite-LLM` |
-| `DEFAULT_MODELS` | `gpt-oss-120b,llama-3.3-70b,gpt-oss-20b,llama-3.1-8b` |
-
-- Add a **Volume** mounted at `/app/backend/data` (persists accounts + chats).
-- **Settings → Networking → Generate Domain**, target port **8080**.
-
-## 4. One-time setup (after first deploy)
+## 3. One-time setup (after first deploy)
 
 Open a shell on the **gateway** service (Railway → service → ⋮ → Shell, or
 `railway run` locally pointed at the project) and run:
@@ -76,7 +54,7 @@ python -m app.scripts.probe_models          # test routes, hide dead ones
 (The SQLite→Postgres migration is only relevant to your old local data; skip it
 on a fresh Railway Postgres.)
 
-## 5. Use the gateway from external clients
+## 4. Use the gateway from external clients
 
 Base URL = your gateway domain + `/v1`. Key = `GATEWAY_API_KEY`.
 
@@ -116,6 +94,6 @@ lists the live ones.
   shell-form `CMD` that honors the platform-injected `$PORT` (default 8000 locally).
 - **Cooldown state** is in-memory per gateway instance — keep the gateway at **1
   replica** so the smart load-balancing/cooldown logic stays coherent.
-- **Rotate the key** by changing `GATEWAY_API_KEY` on the gateway service *and*
-  `OPENAI_API_KEY` on open-webui (they must match).
+- **Rotate the key** by changing `GATEWAY_API_KEY` on the gateway service (and
+  update every client that uses it).
 - **Don't expose Postgres** publicly — leave it on the private network only.

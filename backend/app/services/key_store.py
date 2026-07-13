@@ -1,29 +1,28 @@
 """
-Key Store — bridges UI-configured API keys into the running gateway.
+Key Store — manage encrypted provider API keys and bridge them into the runtime.
 
 FLOW:
-  Settings UI  ──►  ProviderKey table (persisted)
-                       │
-                       ▼
-              os.environ[<VAR>] = value        (apply_persisted_keys / set_keys)
-                       │
-                       ▼
-        litellm.Router rebuilt (reload_router)  ──►  deployments activate
+  add_key()  ──encrypt──►  provider_keys table (ciphertext + masked preview)
+  apply_persisted_keys()  ──decrypt──►  os.environ[<env_slot>] = value
+                                              │
+                                              ▼
+                             litellm.Router rebuilt  ──►  deployments activate
 
-A key saved here behaves exactly like one set in .env: the model pool references
+A key persisted here behaves exactly like one set in .env: the pool references
 `os.environ/<VAR>`, so once the value is in the environment and the Router is
 rebuilt, every deployment using that slot joins the live pool.
 """
 
 import os
 import logging
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
-from app.core.llm_router import list_key_slots, reload_router
-from app.models.provider_key import ProviderKey
+from app.models.provider_api_key import ProviderApiKey
+from app.models.provider import Provider
+from app.services import crypto
 
 logger = logging.getLogger("gateway.keystore")
 
@@ -32,101 +31,119 @@ def mask_value(value: Optional[str]) -> Optional[str]:
     """Return a masked preview of a secret — never the full value."""
     if not value:
         return None
-    if len(value) <= 4:
-        return "••••"
-    return "••••" + value[-4:]
+    return crypto.mask(value)
 
 
 def apply_persisted_keys() -> int:
     """
-    Load all persisted keys into os.environ. Called once at startup BEFORE the
-    Router is built. Returns the number of keys applied.
+    Decrypt every active provider key and inject it into os.environ by its
+    env_slot. Called once at startup BEFORE the Router is built. An explicit
+    environment / .env value WINS over the stored copy (so you can override or
+    rotate a key without the DB clobbering it). Returns the number applied.
     """
     db = SessionLocal()
     try:
-        rows = db.query(ProviderKey).all()
+        rows = db.query(ProviderApiKey).filter(ProviderApiKey.is_active.is_(True)).all()
         applied = 0
         for row in rows:
-            if not row.value:
+            if os.environ.get(row.env_slot):
                 continue
-            # An explicit environment / .env value WINS over the stored copy. This
-            # lets you fix or rotate a key in .env without the (possibly stale)
-            # DB value clobbering it at startup.
-            if os.environ.get(row.env_var):
-                continue
-            os.environ[row.env_var] = row.value
-            applied += 1
+            try:
+                os.environ[row.env_slot] = crypto.decrypt(row.key_ciphertext)
+                applied += 1
+            except Exception as exc:
+                logger.error("Could not decrypt provider key %s: %s", row.env_slot, exc)
         if applied:
-            logger.info("Applied %d persisted API key(s) to the environment.", applied)
+            logger.info("Applied %d persisted provider key(s) to the environment.", applied)
         return applied
     finally:
         db.close()
 
 
-def _provider_for_env_var(env_var: str) -> Optional[str]:
-    for slot in list_key_slots():
-        if slot["env_var"] == env_var:
-            return slot["provider"]
-    return None
-
-
-def set_keys(keys: Dict[str, str]) -> int:
+def add_key(
+    db: Session,
+    *,
+    provider_id: int,
+    env_slot: str,
+    value: str,
+    label: Optional[str] = None,
+    user_id: int,
+) -> ProviderApiKey:
     """
-    Upsert one or more keys (env_var -> value), inject into the environment, and
-    rebuild the Router so the changes take effect immediately. Empty/blank values
-    are ignored (use delete_key to remove). Returns the number of keys written.
+    Upsert an encrypted provider key by env_slot, inject it into the environment,
+    and rebuild the Router so it takes effect immediately.
     """
-    written = 0
-    db: Session = SessionLocal()
-    try:
-        for env_var, value in keys.items():
-            if not value or not value.strip():
-                continue
-            value = value.strip()
-            row = db.query(ProviderKey).filter(ProviderKey.env_var == env_var).first()
-            if row:
-                row.value = value
-            else:
-                row = ProviderKey(
-                    env_var=env_var,
-                    value=value,
-                    provider=_provider_for_env_var(env_var),
-                )
-                db.add(row)
-            os.environ[env_var] = value
-            written += 1
-        db.commit()
-    finally:
-        db.close()
+    value = value.strip()
+    ciphertext = crypto.encrypt(value)
+    masked = crypto.mask(value)
 
-    if written:
-        reload_router()
-        logger.info("Saved %d key(s) and reloaded the Router.", written)
-    return written
+    row = db.query(ProviderApiKey).filter(ProviderApiKey.env_slot == env_slot).first()
+    if row:
+        row.key_ciphertext = ciphertext
+        row.key_masked = masked
+        row.provider_id = provider_id
+        row.is_active = True
+        if label:
+            row.label = label
+    else:
+        row = ProviderApiKey(
+            user_id=user_id,
+            provider_id=provider_id,
+            label=label or env_slot,
+            env_slot=env_slot,
+            key_ciphertext=ciphertext,
+            key_masked=masked,
+        )
+        db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    os.environ[env_slot] = value
+    _reload_router()
+    logger.info("Saved provider key %s and reloaded the Router.", env_slot)
+    return row
 
 
-def delete_key(env_var: str) -> bool:
-    """Remove a persisted key, unset it from the environment, and reload the Router."""
-    db: Session = SessionLocal()
-    try:
-        row = db.query(ProviderKey).filter(ProviderKey.env_var == env_var).first()
-        if not row:
-            return False
-        db.delete(row)
-        db.commit()
-    finally:
-        db.close()
+def list_keys(db: Session) -> List[dict]:
+    """All persisted provider keys with masked values (never the secret)."""
+    rows = (
+        db.query(ProviderApiKey, Provider)
+        .outerjoin(Provider, ProviderApiKey.provider_id == Provider.id)
+        .order_by(ProviderApiKey.env_slot)
+        .all()
+    )
+    return [
+        {
+            "id": pk.id,
+            "provider": prov.slug if prov else None,
+            "env_slot": pk.env_slot,
+            "label": pk.label,
+            "masked": pk.key_masked,
+            "is_active": pk.is_active,
+            "is_in_env": bool(os.environ.get(pk.env_slot)),
+        }
+        for pk, prov in rows
+    ]
 
-    os.environ.pop(env_var, None)
-    reload_router()
-    logger.info("Deleted key %s and reloaded the Router.", env_var)
+
+def delete_key(db: Session, key_id: int) -> bool:
+    """Delete a provider key, unset it from the environment, and rebuild the Router."""
+    row = db.query(ProviderApiKey).filter(ProviderApiKey.id == key_id).first()
+    if not row:
+        return False
+    env_slot = row.env_slot
+    db.delete(row)
+    db.commit()
+    os.environ.pop(env_slot, None)
+    _reload_router()
+    logger.info("Deleted provider key %s and reloaded the Router.", env_slot)
     return True
 
 
-def get_persisted_values() -> Dict[str, str]:
-    """Return {env_var: value} for all persisted keys (used internally for masking/testing)."""
-    db = SessionLocal()
+def _reload_router() -> None:
+    """Rebuild the Router; tolerate failures so key ops never 500 on router issues."""
     try:
-        return {row.env_var: row.value for row in db.query(ProviderKey).all()}
-    finally:
-        db.close()
+        from app.core.llm_router import reload_router
+        reload_router()
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Router reload after key change failed: %s", exc)

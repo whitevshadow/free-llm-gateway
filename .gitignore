@@ -39,11 +39,6 @@ dist-ssr/
 
 # Secrets & local runtime state (NEVER commit)
 .env
-.webui_secret_key
-
-# Open WebUI local install + data (run via Docker instead)
-.openwebui-venv/
-.openwebui-data/
 
 # Claude Code tooling / skills (not part of the app)
 .claude/

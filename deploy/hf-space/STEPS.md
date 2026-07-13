@@ -42,7 +42,7 @@ Optional (cleaner / persistent):
 
 After saving secrets, the Space restarts and builds. Watch the **Logs** tab.
 
-## 3. Use it from clients / the frontend
+## 3. Use it from clients
 
 Base URL = `https://whiteshadows1-gateway.hf.space/v1`, key = your `GATEWAY_API_KEY`.
 
@@ -51,12 +51,6 @@ curl https://whiteshadows1-gateway.hf.space/v1/chat/completions \
   -H "Authorization: Bearer YOUR_GATEWAY_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
-```
-
-For Open WebUI (wherever you host it):
-```
-OPENAI_API_BASE_URL = https://whiteshadows1-gateway.hf.space/v1
-OPENAI_API_KEY      = YOUR_GATEWAY_API_KEY
 ```
 
 ## Caveats (free tier)

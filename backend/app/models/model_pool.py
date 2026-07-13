@@ -1,47 +1,16 @@
 """
-Model pool definitions — the curated deployments + router settings, in Postgres.
+Router configuration — behaviour knobs for the litellm.Router, in Postgres.
 
-These tables are the DB-backed equivalent of config/model_pool.yaml. When
-populated (seed with app/scripts/seed_pool_from_yaml.py), the Router builds from
-here instead of the file, so you can add/disable models and tune routing by
-editing rows — no file edit or image rebuild.
-
-SECURITY: deployments store the *reference* to a key (e.g. "os.environ/GROQ_API_KEY_1"),
-never the secret itself — exactly like the YAML. Resolution + dropping of unset
-keys happens at Router build time, unchanged.
+A single-row table (id=1) the Router builder reads to configure routing strategy,
+retries, cooldowns and cross-model fallbacks. Kept from the legacy pool design;
+the model list itself now comes from the common-model spine (provider_models →
+master_model → deployments → common_model), not from this module.
 """
 
-from sqlalchemy import Column, Integer, String, Boolean, JSON, DateTime
+from sqlalchemy import Column, Integer, String, JSON, DateTime
 from datetime import datetime, timezone
 
 from app.core.database import Base
-
-
-class ModelDeployment(Base):
-    __tablename__ = "model_deployments"
-
-    id = Column(Integer, primary_key=True, index=True)
-    # Virtual model name clients request, e.g. "gpt-oss-120b", "auto".
-    model_name = Column(String, nullable=False, index=True)
-    # Concrete LiteLLM model string, e.g. "groq/openai/gpt-oss-120b".
-    litellm_model = Column(String, nullable=False)
-    # Key reference (NOT the secret): "os.environ/GROQ_API_KEY_1", or None (keyless).
-    api_key_ref = Column(String, nullable=True)
-    # Optional base URL or its env reference (e.g. Ollama).
-    api_base_ref = Column(String, nullable=True)
-    # Optional requests-per-minute hint for the Router.
-    rpm = Column(Integer, nullable=True)
-    # Any other litellm_params (free-form), merged in at build time.
-    extra = Column(JSON, nullable=True)
-    # Disabled rows are skipped (soft delete / quick toggle).
-    enabled = Column(Boolean, default=True, nullable=False, index=True)
-
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(
-        DateTime,
-        default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc),
-    )
 
 
 class RouterConfig(Base):

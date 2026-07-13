@@ -88,8 +88,8 @@ client.embeddings.create(model="embed", input=chunks, extra_body={"input_type": 
 
 ```
                       +-----------------------------+
-                      |     React + Vite SPA        |
-                      |   (Tailwind CSS v4 + SSE)   |
+                      |   OpenAI / Anthropic-style  |
+                      | clients (SDKs, Claude Code) |
                       +--------------+--------------+
                                      |
                                      | API Requests & Streaming (SSE)
@@ -147,57 +147,41 @@ multi-llm-gateway/
 │   │   ├── services/   # Business Logic (LiteLLM, Routing)
 │   │   └── main.py     # Main Entrypoint
 │   ├── tests/          # Tests
+│   ├── Dockerfile      # Backend image
 │   └── requirements.txt
-├── frontend/           # React + Vite Frontend Code
-│   ├── src/
-│   │   ├── components/ # Reusable UI Components
-│   │   ├── context/    # Global State Managers (Auth, Chat)
-│   │   ├── pages/      # Page-level views (Chat, Auth)
-│   │   └── main.jsx
-│   ├── index.html
-│   └── package.json
-├── Dockerfile          # SINGLE multi-stage image — builds & serves BOTH
-├── docker-compose.yml  # One-command deployment
-├── .dockerignore
+├── deploy/             # Hugging Face Space deploy config
+├── docker-compose.yml  # One-command deployment (Postgres + gateway)
 └── README.md
 ```
 
 ---
 
-## Run with Docker (Single Container)
+## Run with Docker
 
-The entire platform — React frontend **and** FastAPI backend — is packaged into
-**one Docker image**. A multi-stage build compiles the SPA, installs the Python
-dependencies, and produces a slim runtime where uvicorn serves the API *and* the
-bundled frontend from a single port. No separate web server or second container.
+`docker compose up` starts **PostgreSQL + the gateway** — that's the whole stack.
+Any OpenAI/Anthropic-compatible client is the "UI".
 
 ```bash
 # 1. Configure your provider API keys
 cp backend/.env.example backend/.env   # then edit backend/.env
+cp .env.example .env                   # gateway key for the public /v1 API
 
 # 2. Build and start (one command)
 docker compose up --build
 ```
 
 Then open:
-- **App UI** → http://localhost:8000
 - **API docs** → http://localhost:8000/docs
 - **Health** → http://localhost:8000/health
 
-The SQLite database is persisted in the `app_data` Docker volume.
+PostgreSQL data is persisted in the `pg_data` Docker volume.
 
-### Without Compose
+### Without Compose (gateway only, SQLite fallback)
 
 ```bash
-docker build -t multi-llm-gateway .
+docker build -t multi-llm-gateway ./backend
 docker run -p 8000:8000 --env-file backend/.env multi-llm-gateway
 ```
-
-> **How it works:** because the SPA and API share the same origin, the frontend
-> is built with `VITE_API_BASE_URL=/api/v1` (a relative path). FastAPI serves the
-> compiled assets from `/app/static` and falls back to `index.html` for client-side
-> routes. Override the API base at build time with
-> `docker build --build-arg VITE_API_BASE_URL=/api/v1 ...` if needed.
 
 ---
 
@@ -205,10 +189,9 @@ docker run -p 8000:8000 --env-file backend/.env multi-llm-gateway
 
 ### Prerequisites
 - Python 3.10+
-- Node.js 18+ (npm 9+)
 - Docker & Docker Compose (optional for local deployment)
 
-### 1. Backend Setup
+### Backend Setup
 ```powershell
 cd backend
 
@@ -228,20 +211,6 @@ copy .env.example .env
 uvicorn app.main:app --reload
 ```
 
-### 2. Frontend Setup
-```powershell
-cd frontend
-
-# Install package dependencies
-npm install
-
-# Create environment configuration
-copy .env.example .env
-
-# Launch Vite development server
-npm run dev
-```
-
 ---
 
 ## Initial Milestones
@@ -258,5 +227,4 @@ npm run dev
 ## Coding Standards & Conventions
 
 - **Python (PEP 8)**: Formatted with `black`, linted with `ruff`.
-- **Javascript/React**: Explicit component files (`.jsx`), functional components with hooks, formatted with Prettier, clean CSS design tokens.
 - **Commit Messages**: Semantic Commits (e.g., `feat:`, `fix:`, `chore:`, `docs:`).
