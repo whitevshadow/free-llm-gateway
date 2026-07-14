@@ -19,7 +19,7 @@ failure. Add another free account = add another env key + a deployment line in
 
 ### Configure free keys (each one multiplies your limits)
 
-In `backend/.env` — fill in only what you have:
+In the repo-root `.env` — fill in only what you have:
 
 ```dotenv
 GROQ_API_KEY_1=...      # https://console.groq.com/keys   (gpt-oss-120b/20b, Llama, Qwen)
@@ -162,25 +162,26 @@ multi-llm-gateway/
 Any OpenAI/Anthropic-compatible client is the "UI".
 
 ```bash
-# 1. Configure your provider API keys
-cp backend/.env.example backend/.env   # then edit backend/.env
-cp .env.example .env                   # gateway key for the public /v1 API
+# 1. One .env at the repo root — SECRET_KEY + ENCRYPTION_KEY (and optionally
+#    MASTER_ADMIN_KEY for a stable admin credential).
+cp .env.example .env                   # then edit .env
 
-# 2. Build and start (one command)
+# 2. Build and start (one command). Frontend + API share ONE port.
 docker compose up --build
 ```
 
 Then open:
-- **API docs** → http://localhost:8000/docs
-- **Health** → http://localhost:8000/health
+- **UI** → http://localhost:8080
+- **API docs** → http://localhost:8080/docs
+- **Health** → http://localhost:8080/health
 
 PostgreSQL data is persisted in the `pg_data` Docker volume.
 
-### Without Compose (gateway only, SQLite fallback)
+### Without Compose (single image, gateway + UI)
 
 ```bash
-docker build -t multi-llm-gateway ./backend
-docker run -p 8000:8000 --env-file backend/.env multi-llm-gateway
+docker build -t multi-llm-gateway .        # build context is the repo root
+docker run -p 8080:8000 --env-file .env multi-llm-gateway
 ```
 
 ---
