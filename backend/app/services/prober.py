@@ -1,198 +1,257 @@
 """
-Per-key probe (Phase 4) — test every (provider_model × key) and record health.
+Prober — test whether a specific (model × key) pair actually works.
 
-For each probe target it pings the concrete model with the specific key, then
-upserts a `deployments` row (per key) with the result and rolls up the parent
-`master_model` (is_working = any key works, working_key_count). The ping function
-is injectable so the DB logic can be tested without network/keys.
+Health is PER KEY, so the unit of probing is a DEPLOYMENT, not a model. One
+exhausted Groq key must be benched without touching its sibling.
 
-Health classes (ModelHealth): a 429 counts as REACHABLE (rate_limited → working),
-since the key is valid and just throttled; auth/timeout/other errors are not.
+CONCURRENCY IS CAPPED, and that is not an optimisation. Adding one Groq key fans
+out ~30 deployments; probing them all at once fires 30 simultaneous requests at a
+free tier and rate-limits the very key we are trying to validate. We probe a few
+at a time.
+
+A 429 IS NOT A FAILURE. It means the key is valid and merely throttled — it earns
+a cooldown, not a death sentence. An auth error is the opposite: no cooldown will
+ever fix it. Collapsing those two into one boolean is exactly what the
+`model_health` enum exists to prevent.
+
+Runs in the BACKGROUND: adding a key returns immediately with its deployments
+marked 'unavailable', and this promotes them as results land.
 """
 
+import asyncio
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Dict, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
 
+import litellm
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
-from app.models.provider import Provider
-from app.models.provider_api_key import ProviderApiKey
-from app.models.provider_model import ProviderModel
-from app.models.master_model import MasterModel
 from app.models.deployment import Deployment
-from app.models.enums import ModelHealth
-from app.services.normalize import provider_slug, upstream_id, normalize_model_name
+from app.models.enums import ModelHealth, ModelMode
+from app.models.provider import Provider
+from app.models.provider_key import ProviderKey
+from app.models.provider_model import ProviderModel
+from app.services import crypto
 
 logger = logging.getLogger("gateway.prober")
 
-# A ping returns (status, http_code, latency_ms, error).
-PingResult = Tuple[ModelHealth, Optional[int], Optional[int], Optional[str]]
-PingFn = Callable[[dict], PingResult]
+# How many probes may be in flight at once. Deliberately small: these all hit the
+# SAME provider with the SAME key, so this is literally the number of concurrent
+# requests we are pointing at one free-tier account.
+MAX_CONCURRENCY = 4
 
-_WORKING = {ModelHealth.available, ModelHealth.rate_limited}
-
-
-def _default_ping(target: dict) -> PingResult:
-    """Real 1-token completion, no retries. Classifies the outcome."""
-    import litellm
-
-    kwargs = {
-        "model": target["model"],
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
-        "timeout": 20,
-        "num_retries": 0,
-        "max_retries": 0,
-    }
-    if target.get("api_key"):
-        kwargs["api_key"] = target["api_key"]
-    if target.get("api_base"):
-        kwargs["api_base"] = target["api_base"]
-    kwargs.update(target.get("extra_params") or {})
-
-    start = time.perf_counter()
-    try:
-        litellm.completion(**kwargs)
-        return ModelHealth.available, 200, int((time.perf_counter() - start) * 1000), None
-    except Exception as exc:  # classify by message/type
-        latency = int((time.perf_counter() - start) * 1000)
-        msg = str(exc)
-        low = msg.lower()
-        code = getattr(exc, "status_code", None)
-        if "429" in low or "rate limit" in low or "quota" in low:
-            return ModelHealth.rate_limited, 429, latency, msg[:500]
-        if any(k in low for k in ("authentication", "invalid api key", "unauthorized", "401", "403")):
-            return ModelHealth.auth_error, code or 401, latency, msg[:500]
-        if "timeout" in low or "timed out" in low:
-            return ModelHealth.timeout, code, latency, msg[:500]
-        return ModelHealth.error, code, latency, msg[:500]
+PROBE_TIMEOUT = 20            # seconds per probe
+RATE_LIMIT_COOLDOWN = 60      # seconds to bench a deployment that 429s while probing
 
 
-def probe(targets=None, ping: PingFn = _default_ping, max_workers: int = 16) -> dict:
+# ── Probe progress, per user ─────────────────────────────────────────────────
+#  Probes run in the background, so without this the UI has no way to say "how
+#  far along" — only "still going". In-memory is the right weight: progress is
+#  ephemeral, single-process, and worthless after a restart anyway.
+#
+#  Concurrent jobs for one user (e.g. Discover re-probing two keys = two
+#  background tasks) AGGREGATE: totals add up, ticks share one counter, so the
+#  bar reads "212 models" instead of restarting at 106 halfway through.
+_progress: Dict[int, Dict[str, float]] = {}
+
+# If a job crashes mid-flight, done never reaches total. Rather than a bar stuck
+# at 97% forever, a job with no tick for this long is reported as inactive.
+_STALE_AFTER = 90.0  # seconds
+
+
+def _job_start(user_id: int, count: int) -> None:
+    now = time.time()
+    p = _progress.get(user_id)
+    if p and p["done"] < p["total"] and (now - p["updated"]) < _STALE_AFTER:
+        p["total"] += count          # another batch joined a running job
+        p["updated"] = now
+    else:
+        _progress[user_id] = {"total": float(count), "done": 0.0, "updated": now}
+
+
+def _job_tick(user_id: int) -> None:
+    p = _progress.get(user_id)
+    if p:
+        p["done"] += 1
+        p["updated"] = time.time()
+
+
+def get_progress(user_id: int) -> Dict:
+    """What GET /v1/me/probe-status returns. active=False once done or stale."""
+    p = _progress.get(user_id)
+    if not p:
+        return {"active": False, "total": 0, "done": 0}
+    stale = (time.time() - p["updated"]) > _STALE_AFTER
+    done, total = int(p["done"]), int(p["total"])
+    return {"active": done < total and not stale, "total": total, "done": done}
+
+
+def _classify(exc: Exception) -> Tuple[ModelHealth, Optional[int], str]:
+    """Map a litellm exception onto our health enum. These distinctions matter."""
+    name = type(exc).__name__
+    msg = str(exc)
+    code = getattr(exc, "status_code", None)
+
+    if isinstance(exc, litellm.RateLimitError) or code == 429:
+        return ModelHealth.rate_limited, 429, msg     # key WORKS, just throttled
+    if isinstance(exc, litellm.AuthenticationError) or code in (401, 403):
+        return ModelHealth.auth_error, code, msg      # key is dead; no cooldown helps
+    if isinstance(exc, litellm.Timeout) or "timeout" in name.lower():
+        return ModelHealth.timeout, None, msg
+    if isinstance(exc, litellm.NotFoundError) or code == 404:
+        return ModelHealth.unavailable, 404, msg      # listed, but not served to us
+    return ModelHealth.error, code, msg
+
+
+async def _probe_one(
+    litellm_model: str, api_key: str, api_base: Optional[str],
+    mode: ModelMode = ModelMode.chat,
+) -> Dict:
     """
-    Probe every target. `targets` defaults to llm_router.all_probe_targets().
-    Keyless targets (no env slot) are skipped — a deployment needs a key row.
+    One cheap request, with the key passed IN — never via os.environ.
 
-    Pings run concurrently (network-bound) in a thread pool; all DB work happens
-    on the main thread (SQLAlchemy sessions are not thread-safe).
+    THE PROBE MUST MATCH THE MODE. An embedding model cannot answer a chat
+    completion, so probing it with one would mark every embedding model dead
+    forever. Chat models get a 1-token completion; embedding models embed the
+    word "ping".
     """
-    if targets is None:
-        from app.core.llm_router import all_probe_targets
-        targets = all_probe_targets()
-
-    db = SessionLocal()
+    started = datetime.now(timezone.utc)
     try:
-        # 1) Resolve rows (main thread): (target, master_id, key_id) per probeable.
-        #    Dedupe by (master, key) so the same concrete model+key appearing under
-        #    multiple virtual names is probed once (and can't collide on insert).
-        pcache: Dict[str, Provider] = {}
-        plan = []
-        seen_pairs = set()
-        for t in targets:
-            model = t.get("model", "")
-            env_slot = t.get("api_key_var")
-            if not model or not env_slot:
-                continue  # keyless deployment — skip (no provider_keys row to bind)
-            key_row = db.query(ProviderApiKey).filter(ProviderApiKey.env_slot == env_slot).first()
-            if not key_row:
-                continue  # discovery hasn't imported this key yet
-            prov = _provider(db, t.get("provider") or provider_slug(model), pcache)
-            pm = _provider_model(db, prov.id, model, t.get("mode", "chat"))
-            mm = _master_model(db, pm, prov.id)
-            pair = (mm.id, key_row.id)
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            plan.append((t, mm.id, key_row.id))
-        db.commit()
+        if mode is ModelMode.embedding:
+            kwargs: Dict = {}
+            # NVIDIA's retrieval models are asymmetric and REQUIRE input_type;
+            # without it the probe 400s and a healthy model looks broken.
+            if litellm_model.startswith("nvidia_nim/"):
+                kwargs["input_type"] = "query"
+            await litellm.aembedding(
+                model=litellm_model,
+                input=["ping"],
+                api_key=api_key,
+                api_base=api_base,
+                timeout=PROBE_TIMEOUT,
+                **kwargs,
+            )
+        else:
+            await litellm.acompletion(
+                model=litellm_model,
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1,
+                api_key=api_key,
+                api_base=api_base,
+                timeout=PROBE_TIMEOUT,
+            )
+        latency = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+        return {"status": ModelHealth.available, "http_code": 200,
+                "latency_ms": latency, "error": None}
+    except Exception as exc:
+        status, code, msg = _classify(exc)
+        return {"status": status, "http_code": code, "latency_ms": None, "error": msg[:500]}
 
-        # 2) Ping concurrently (no DB access inside threads).
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            results = list(ex.map(lambda item: ping(item[0]), plan))
 
-        # 3) Upsert deployments (main thread).
-        touched = set()
-        for (t, master_id, key_id), (status, http_code, latency_ms, error) in zip(plan, results):
-            working = status in _WORKING
-            _upsert_deployment(db, master_id, key_id, t["model"], status, http_code, latency_ms, error, working)
-            touched.add(master_id)
-        db.commit()
+async def probe_deployments(deployment_ids: List[int]) -> Dict:
+    """
+    Probe the given deployments, at most MAX_CONCURRENCY at a time, writing the
+    results back. Opens its own session — this runs detached from the request that
+    queued it.
+    """
+    if not deployment_ids:
+        return {"probed": 0}
 
-        # 4) Roll up each touched master_model from its deployments.
-        from datetime import datetime, timezone
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+    db: Session = SessionLocal()
+
+    try:
+        rows = (
+            db.query(Deployment, ProviderModel, ProviderKey, Provider)
+            .join(ProviderModel, ProviderModel.id == Deployment.provider_model_id)
+            .join(ProviderKey, ProviderKey.id == Deployment.provider_key_id)
+            .join(Provider, Provider.id == Deployment.provider_id)
+            .filter(Deployment.id.in_(deployment_ids))
+            .all()
+        )
+        if not rows:
+            return {"probed": 0}
+
+        # All rows in one call belong to one user (probe_key / probe_user).
+        owner_id = rows[0][0].user_id
+        _job_start(owner_id, len(rows))
+
+        # Decrypt once per key, not once per deployment.
+        plaintext: Dict[int, str] = {}
+        for _, _, key, _ in rows:
+            if key.id not in plaintext:
+                plaintext[key.id] = crypto.decrypt(key.key_ciphertext)
+
+        async def run(dep, model, key, provider):
+            async with sem:
+                result = await _probe_one(
+                    model.litellm_model, plaintext[key.id], provider.base_url,
+                    mode=model.mode,
+                )
+                # Tick as each probe RETURNS, not when results are written — the
+                # bar should move during the slow part, not jump at the end.
+                _job_tick(owner_id)
+                return dep.id, result
+
+        results = await asyncio.gather(
+            *(run(d, m, k, p) for d, m, k, p in rows), return_exceptions=True
+        )
+
+        by_id = {d.id: d for d, _, _, _ in rows}
+        counts: Dict[str, int] = {}
         now = datetime.now(timezone.utc)
-        working_models = 0
-        for master_id in touched:
-            deps = db.query(Deployment).filter(Deployment.master_model_id == master_id).all()
-            live = [d for d in deps if d.is_working]
-            mm = db.query(MasterModel).filter(MasterModel.id == master_id).first()
-            mm.is_working = bool(live)
-            mm.working_key_count = len(live)
-            mm.last_checked_at = now
-            if mm.is_working:
-                working_models += 1
-        db.commit()
 
-        logger.info("Probe: %d deployment(s) tested, %d working master model(s).", len(plan), working_models)
-        return {"probed": len(plan), "working_master_models": working_models}
+        for item in results:
+            if isinstance(item, Exception):
+                logger.warning("Probe task crashed: %s", item)
+                continue
+            dep_id, res = item
+            dep = by_id[dep_id]
+            dep.status = res["status"]
+            dep.http_code = res["http_code"]
+            dep.latency_ms = res["latency_ms"]
+            dep.error = res["error"]
+            dep.last_checked_at = now
+
+            # A 429 gets a cooldown, so is_callable() revives it automatically once
+            # it expires. Anything else CLEARS the cooldown: a dead key must never
+            # be resurrected by a stale timer.
+            if res["status"] is ModelHealth.rate_limited:
+                dep.cooldown_until = now + timedelta(seconds=RATE_LIMIT_COOLDOWN)
+            else:
+                dep.cooldown_until = None
+
+            # is_working is GENERATED from status — never assign it.
+            counts[res["status"].value] = counts.get(res["status"].value, 0) + 1
+
+        db.commit()
+        logger.info("Probed %d deployment(s): %s", len(rows), counts)
+        return {"probed": len(rows), **counts}
     finally:
         db.close()
 
 
-# ── upsert helpers ──────────────────────────────────────────────────────────
-
-def _provider(db, slug, cache):
-    if slug in cache:
-        return cache[slug]
-    prov = db.query(Provider).filter(Provider.slug == slug).first()
-    if not prov:
-        prov = Provider(slug=slug, name=slug, litellm_prefix=slug)
-        db.add(prov); db.commit(); db.refresh(prov)
-    cache[slug] = prov
-    return prov
-
-
-def _provider_model(db, provider_id, litellm_model, mode):
-    up = upstream_id(litellm_model)
-    pm = (db.query(ProviderModel)
-            .filter(ProviderModel.provider_id == provider_id, ProviderModel.upstream_model_id == up)
-            .first())
-    if not pm:
-        from app.models.enums import ModelMode
-        try:
-            mode_enum = ModelMode(mode)
-        except ValueError:
-            mode_enum = ModelMode.chat
-        pm = ProviderModel(provider_id=provider_id, upstream_model_id=up, litellm_model=litellm_model,
-                           normalized_name=normalize_model_name(litellm_model), mode=mode_enum)
-        db.add(pm); db.commit(); db.refresh(pm)
-    return pm
+async def probe_key(provider_key_id: int) -> Dict:
+    """Probe every deployment of one key — what runs in the background after a key is added."""
+    db = SessionLocal()
+    try:
+        ids = [
+            d.id for d in db.query(Deployment).filter(
+                Deployment.provider_key_id == provider_key_id
+            )
+        ]
+    finally:
+        db.close()
+    return await probe_deployments(ids)
 
 
-def _master_model(db, pm, provider_id):
-    mm = db.query(MasterModel).filter(MasterModel.provider_model_id == pm.id).first()
-    if not mm:
-        mm = MasterModel(provider_model_id=pm.id, provider_id=provider_id,
-                         litellm_model=pm.litellm_model, normalized_name=pm.normalized_name)
-        db.add(mm); db.commit(); db.refresh(mm)
-    return mm
-
-
-def _upsert_deployment(db, master_id, key_id, litellm_model, status, http_code, latency_ms, error, working):
-    from datetime import datetime, timezone
-    dep = (db.query(Deployment)
-             .filter(Deployment.master_model_id == master_id, Deployment.provider_key_id == key_id)
-             .first())
-    if not dep:
-        dep = Deployment(master_model_id=master_id, provider_key_id=key_id, litellm_model=litellm_model)
-        db.add(dep)
-    dep.litellm_model = litellm_model
-    dep.status = status
-    dep.http_code = http_code
-    dep.latency_ms = latency_ms
-    dep.error = error
-    dep.is_working = working
-    dep.last_checked_at = datetime.now(timezone.utc)
+async def probe_user(user_id: int) -> Dict:
+    """Re-probe everything a user owns (the periodic refresh)."""
+    db = SessionLocal()
+    try:
+        ids = [d.id for d in db.query(Deployment).filter(Deployment.user_id == user_id)]
+    finally:
+        db.close()
+    return await probe_deployments(ids)

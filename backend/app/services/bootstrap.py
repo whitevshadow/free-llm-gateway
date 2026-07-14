@@ -1,11 +1,12 @@
 """
 Bootstrap — make the gateway usable on first startup.
 
-With /v1 auth DB-only and secure-by-default, and key management behind the
-gateway-guarded admin API, a fresh database is a chicken-and-egg: you can't mint
-the first key without a key. This ensures a single owner user exists and, if no
-active gateway key exists, mints one and logs it ONCE so the operator can grab it
-from the startup logs.
+There is no signup flow, and minting a key requires an admin key: a fresh database
+is therefore a chicken-and-egg. This creates the first ADMIN user and mints their
+gateway key, logging it ONCE so the operator can grab it from the startup logs.
+
+That key is the root of the whole system: it is the only way to seed providers and
+to mint keys for other users.
 """
 
 import logging
@@ -19,36 +20,35 @@ from app.services import gateway_keys
 logger = logging.getLogger("gateway.bootstrap")
 
 
-def ensure_owner_and_bootstrap_key() -> None:
+def ensure_admin_and_bootstrap_key() -> None:
+    """Create the admin user + their key if the database has no admin yet."""
     db = SessionLocal()
     try:
-        user = db.query(User).first()
-        if not user:
-            # No login flow anymore — hashed_password is a required-but-unused
-            # column, so store a non-usable sentinel instead of a real hash.
-            user = User(
-                email=settings.OWNER_EMAIL,
-                hashed_password="disabled",
-                full_name="Owner",
-            )
-            db.add(user)
+        admin = db.query(User).filter(User.is_admin.is_(True)).first()
+        if not admin:
+            admin = User(email=settings.OWNER_EMAIL, is_admin=True)
+            db.add(admin)
             db.commit()
-            db.refresh(user)
-            logger.info("Created owner user %s.", settings.OWNER_EMAIL)
+            db.refresh(admin)
+            logger.info("Created admin user %s.", settings.OWNER_EMAIL)
 
-        active = (
+        live = (
             db.query(GatewayApiKey)
-            .filter(GatewayApiKey.is_active.is_(True))
+            .filter(
+                GatewayApiKey.user_id == admin.id,
+                GatewayApiKey.revoked_at.is_(None),
+            )
             .count()
         )
-        if active == 0:
-            token, _ = gateway_keys.mint(db, user.id, name="bootstrap")
+        if live == 0:
+            token, _ = gateway_keys.mint(db, admin.id, name="bootstrap-admin")
             bar = "=" * 66
             logger.warning(bar)
-            logger.warning("BOOTSTRAP GATEWAY KEY (shown once — copy it now):")
+            logger.warning("BOOTSTRAP ADMIN KEY (shown once — copy it now):")
             logger.warning("    %s", token)
-            logger.warning("Send it as:  Authorization: Bearer <key>   or   x-api-key: <key>")
-            logger.warning("Mint more / rotate via  POST /v1/admin/gateway-keys")
+            logger.warning("Send as:  Authorization: Bearer <key>   or   x-api-key: <key>")
+            logger.warning("Seed providers:  POST /v1/admin/providers")
+            logger.warning("Mint user keys:  POST /v1/admin/gateway-keys")
             logger.warning(bar)
     finally:
         db.close()

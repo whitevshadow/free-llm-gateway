@@ -1,149 +1,201 @@
 """
-Key Store — manage encrypted provider API keys and bridge them into the runtime.
+Key store — a user's own provider keys, and the fan-out that gives them models.
 
-FLOW:
-  add_key()  ──encrypt──►  provider_keys table (ciphertext + masked preview)
-  apply_persisted_keys()  ──decrypt──►  os.environ[<env_slot>] = value
-                                              │
-                                              ▼
-                             litellm.Router rebuilt  ──►  deployments activate
+THE OLD DESIGN WAS BROKEN UNDER MULTI-USER, and it is worth saying why, because
+the fix is the whole point of this module:
 
-A key persisted here behaves exactly like one set in .env: the pool references
-`os.environ/<VAR>`, so once the value is in the environment and the Router is
-rebuilt, every deployment using that slot joins the live pool.
+    apply_persisted_keys()  decrypted EVERY user's key into os.environ, keyed by
+    an `env_slot` name like GROQ_API_KEY_1. But a process has exactly ONE
+    os.environ. Two users with Groq keys collided in the same slot, so whichever
+    key was written last served EVERYONE's traffic — silently billing one user's
+    requests to another user's quota.
+
+Keys now never touch os.environ. They are decrypted on demand and passed straight
+into litellm as `api_key=...` on the specific deployment being called. There is no
+shared namespace to collide in. `env_slot` is gone from the schema entirely.
+
+THE FAN-OUT — how a user acquires callable models:
+
+    add_key(alice, groq, "sk-...")
+      → 1 provider_keys row
+      → N deployments rows, one per model Groq serves (from the catalog)
+      → each starts 'unavailable' and is probed in the BACKGROUND
+
+The user's model list IS those deployments. They cannot see a model they hold no
+key for, because the row only exists through their key (FK-enforced).
 """
 
-import os
 import logging
 from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.core.database import SessionLocal
-from app.models.provider_api_key import ProviderApiKey
+from app.models.deployment import Deployment
+from app.models.enums import ModelHealth
 from app.models.provider import Provider
+from app.models.provider_key import ProviderKey
+from app.models.provider_model import ProviderModel
 from app.services import crypto
 
 logger = logging.getLogger("gateway.keystore")
 
 
-def mask_value(value: Optional[str]) -> Optional[str]:
-    """Return a masked preview of a secret — never the full value."""
-    if not value:
-        return None
-    return crypto.mask(value)
+def reveal(db: Session, provider_key_id: int) -> str:
+    """
+    Decrypt a key for immediate use in an outbound call.
+
+    The ONLY place plaintext exists is the return value of this function, on the
+    stack, for the duration of one request. It is never stored, never logged, and
+    never returned by the API.
+    """
+    row = db.query(ProviderKey).filter(ProviderKey.id == provider_key_id).one()
+    return crypto.decrypt(row.key_ciphertext)
 
 
-def apply_persisted_keys() -> int:
+def fan_out(db: Session, key: ProviderKey) -> int:
     """
-    Decrypt every active provider key and inject it into os.environ by its
-    env_slot. Called once at startup BEFORE the Router is built. An explicit
-    environment / .env value WINS over the stored copy (so you can override or
-    rotate a key without the DB clobbering it). Returns the number applied.
+    Create one deployment per catalog model this key's provider serves.
+
+    Deployments start as 'unavailable' — NOT 'available'. An unprobed key is an
+    unknown key, and claiming otherwise would route real traffic at it. The probe
+    (run in the background by the caller) is what promotes them.
+
+    Idempotent: skips models that already have a deployment for this key, so
+    re-running after the catalog grows only adds what's new.
     """
-    db = SessionLocal()
-    try:
-        rows = db.query(ProviderApiKey).filter(ProviderApiKey.is_active.is_(True)).all()
-        applied = 0
-        for row in rows:
-            if os.environ.get(row.env_slot):
-                continue
-            try:
-                os.environ[row.env_slot] = crypto.decrypt(row.key_ciphertext)
-                applied += 1
-            except Exception as exc:
-                logger.error("Could not decrypt provider key %s: %s", row.env_slot, exc)
-        if applied:
-            logger.info("Applied %d persisted provider key(s) to the environment.", applied)
-        return applied
-    finally:
-        db.close()
+    models = (
+        db.query(ProviderModel)
+        .filter(
+            ProviderModel.provider_id == key.provider_id,
+            ProviderModel.enabled.is_(True),
+        )
+        .all()
+    )
+    existing = {
+        d.provider_model_id
+        for d in db.query(Deployment).filter(Deployment.provider_key_id == key.id).all()
+    }
+
+    created = 0
+    for m in models:
+        if m.id in existing:
+            continue
+        db.add(
+            Deployment(
+                user_id=key.user_id,
+                provider_id=key.provider_id,   # composite FKs check this matches both sides
+                provider_model_id=m.id,
+                provider_key_id=key.id,
+                status=ModelHealth.unavailable,   # until probed
+            )
+        )
+        created += 1
+
+    db.commit()
+    logger.info(
+        "Fanned out key %s (user %s): %d new deployment(s).", key.id, key.user_id, created
+    )
+    return created
 
 
 def add_key(
     db: Session,
     *,
+    user_id: int,
     provider_id: int,
-    env_slot: str,
     value: str,
     label: Optional[str] = None,
-    user_id: int,
-) -> ProviderApiKey:
+) -> ProviderKey:
     """
-    Upsert an encrypted provider key by env_slot, inject it into the environment,
-    and rebuild the Router so it takes effect immediately.
+    Encrypt and store a user's provider key, then fan it out into deployments.
+
+    Scoped by user_id throughout. The old version upserted by env_slot with NO
+    user filter, so one user saving a key would OVERWRITE another user's row for
+    the same slot. Here, (user_id, provider_id, label) is unique — two users can
+    hold as many keys as they like without ever touching each other's.
     """
     value = value.strip()
-    ciphertext = crypto.encrypt(value)
-    masked = crypto.mask(value)
+    if not value:
+        raise ValueError("An empty API key cannot be stored.")
 
-    row = db.query(ProviderApiKey).filter(ProviderApiKey.env_slot == env_slot).first()
+    label = label or f"key-{crypto.mask(value)}"
+
+    row = (
+        db.query(ProviderKey)
+        .filter(
+            ProviderKey.user_id == user_id,
+            ProviderKey.provider_id == provider_id,
+            ProviderKey.label == label,
+        )
+        .first()
+    )
     if row:
-        row.key_ciphertext = ciphertext
-        row.key_masked = masked
-        row.provider_id = provider_id
+        row.key_ciphertext = crypto.encrypt(value)
+        row.key_masked = crypto.mask(value)
         row.is_active = True
-        if label:
-            row.label = label
     else:
-        row = ProviderApiKey(
+        row = ProviderKey(
             user_id=user_id,
             provider_id=provider_id,
-            label=label or env_slot,
-            env_slot=env_slot,
-            key_ciphertext=ciphertext,
-            key_masked=masked,
+            label=label,
+            key_ciphertext=crypto.encrypt(value),
+            key_masked=crypto.mask(value),
         )
         db.add(row)
+
     db.commit()
     db.refresh(row)
 
-    os.environ[env_slot] = value
-    _reload_router()
-    logger.info("Saved provider key %s and reloaded the Router.", env_slot)
+    fan_out(db, row)
     return row
 
 
-def list_keys(db: Session) -> List[dict]:
-    """All persisted provider keys with masked values (never the secret)."""
+def list_keys(db: Session, user_id: int) -> List[dict]:
+    """A user's own keys, masked. Never returns the secret."""
     rows = (
-        db.query(ProviderApiKey, Provider)
-        .outerjoin(Provider, ProviderApiKey.provider_id == Provider.id)
-        .order_by(ProviderApiKey.env_slot)
+        db.query(ProviderKey, Provider)
+        .join(Provider, ProviderKey.provider_id == Provider.id)
+        .filter(ProviderKey.user_id == user_id)
+        .order_by(ProviderKey.id)
         .all()
     )
-    return [
-        {
-            "id": pk.id,
-            "provider": prov.slug if prov else None,
-            "env_slot": pk.env_slot,
-            "label": pk.label,
-            "masked": pk.key_masked,
-            "is_active": pk.is_active,
-            "is_in_env": bool(os.environ.get(pk.env_slot)),
-        }
-        for pk, prov in rows
-    ]
+    out = []
+    for pk, prov in rows:
+        live = (
+            db.query(Deployment)
+            .filter(Deployment.provider_key_id == pk.id, Deployment.is_working.is_(True))
+            .count()
+        )
+        total = db.query(Deployment).filter(Deployment.provider_key_id == pk.id).count()
+        out.append(
+            {
+                "id": pk.id,
+                "provider": prov.slug,
+                "label": pk.label,
+                "masked": pk.key_masked,
+                "is_active": pk.is_active,
+                "working_models": live,
+                "total_models": total,
+            }
+        )
+    return out
 
 
-def delete_key(db: Session, key_id: int) -> bool:
-    """Delete a provider key, unset it from the environment, and rebuild the Router."""
-    row = db.query(ProviderApiKey).filter(ProviderApiKey.id == key_id).first()
+def delete_key(db: Session, key_id: int, user_id: int) -> bool:
+    """
+    Delete one of THIS user's keys. Its deployments cascade away with it.
+
+    user_id is not optional: without it, any authenticated user could delete
+    anyone's key by guessing an id.
+    """
+    row = (
+        db.query(ProviderKey)
+        .filter(ProviderKey.id == key_id, ProviderKey.user_id == user_id)
+        .first()
+    )
     if not row:
         return False
-    env_slot = row.env_slot
-    db.delete(row)
+    db.delete(row)   # deployments cascade (FK ON DELETE CASCADE)
     db.commit()
-    os.environ.pop(env_slot, None)
-    _reload_router()
-    logger.info("Deleted provider key %s and reloaded the Router.", env_slot)
+    logger.info("Deleted provider key %s for user %s.", key_id, user_id)
     return True
-
-
-def _reload_router() -> None:
-    """Rebuild the Router; tolerate failures so key ops never 500 on router issues."""
-    try:
-        from app.core.llm_router import reload_router
-        reload_router()
-    except Exception as exc:  # pragma: no cover
-        logger.warning("Router reload after key change failed: %s", exc)

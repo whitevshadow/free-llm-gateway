@@ -1,0 +1,28 @@
+# Build context = repo root. Keep it small and never ship secrets.
+.git
+.gitignore
+
+# Secrets — MUST never enter the image.
+.env
+**/.env
+!.env.example
+!**/.env.example
+
+# Frontend: node_modules is huge and the image rebuilds it anyway.
+frontend/node_modules
+frontend/dist
+
+# The SPA is compiled INSIDE the image by the node stage. A stale local build
+# copied in would silently shadow it.
+backend/static
+
+# Python noise
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.venv
+venv
+
+# Docs / deploy configs not needed at runtime
+*.md
+deploy

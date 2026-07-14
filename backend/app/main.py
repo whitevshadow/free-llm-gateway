@@ -12,11 +12,15 @@ This is where everything comes together:
 STARTUP CHECKLIST (what happens when you run `uvicorn app.main:app`):
   1. Settings are loaded from .env via pydantic-settings.
   2. Logging is configured.
-  3. Database engine is created, tables are auto-generated.
-  4. Provider API keys are injected into os.environ (by llm_service import).
+  3. schema.sql is applied if the database is empty (NOT create_all — that
+     cannot emit the triggers/views the integrity guarantees depend on).
+  4. The first admin user + their gateway key are bootstrapped and logged once.
   5. Middleware stack is mounted.
   6. Routes are registered.
   7. The server starts listening on HOST:PORT.
+
+Routers are built PER USER on first request. There is no global router and no
+global key namespace: keys are decrypted per call and passed into litellm.
 """
 
 import time
@@ -28,9 +32,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
-from app.core.database import engine, Base
 from app.api.router import api_router
-from app.api import openai_compat, anthropic_compat, admin
+from app.api import openai_compat, anthropic_compat, admin, me
 from app.middleware.request_id import RequestIDMiddleware
 from app.middleware.logging_middleware import LoggingMiddleware
 from app.exceptions import GatewayException
@@ -73,48 +76,39 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Debug: {settings.DEBUG}")
     logger.info("=" * 60)
 
-    # Auto-create tables. Import the model package first so EVERY table (incl.
-    # provider_keys and model_availability) is registered on Base.metadata.
+    # Apply schema.sql if the database is empty.
+    #
+    # NOT Base.metadata.create_all(): that cannot emit triggers, functions or
+    # views, so it would build a database that LOOKS right while silently
+    # lacking every guarantee the schema depends on — the is_common /
+    # is_reachable triggers, is_callable(), and both routing views.
+    # schema.sql is the source of truth; the ORM only maps onto it.
     try:
         import app.models  # noqa: F401  (registers all ORM models)
-        Base.metadata.create_all(bind=engine)
-        logger.info("Database tables initialised successfully.")
+        from app.core.database import init_schema
+        if init_schema():
+            logger.info("Empty database — applied schema.sql.")
+        else:
+            logger.info("Database schema already present.")
     except Exception as exc:
         logger.error(f"Database initialisation failed: {exc}")
 
     # Ensure the owner user + a gateway key exist so the admin API is reachable
     # on a fresh DB (the bootstrap key is logged once).
     try:
-        from app.services.bootstrap import ensure_owner_and_bootstrap_key
-        ensure_owner_and_bootstrap_key()
+        from app.services.bootstrap import ensure_admin_and_bootstrap_key
+        ensure_admin_and_bootstrap_key()
     except Exception as exc:
         logger.error(f"Bootstrap failed: {exc}")
 
-    # Decrypt persisted provider keys into the environment BEFORE the Router is
-    # built, so they activate their deployments.
-    try:
-        from app.services.key_store import apply_persisted_keys
-        apply_persisted_keys()
-    except Exception as exc:
-        logger.error(f"Could not apply persisted keys: {exc}")
-
-    # Log provider configuration status
-    configured = settings.get_configured_providers()
-    logger.info(f"Configured providers: {', '.join(configured) if configured else 'NONE'}")
-
-    # Build the smart Router from the free-provider pool and log its size.
-    try:
-        from app.core.llm_router import get_router, router_health
-        get_router()
-        health = router_health()
-        logger.info(
-            "Smart Router ready: %d deployment(s) across %d virtual model(s): %s",
-            health["total_deployments"],
-            len(health["virtual_models"]),
-            ", ".join(health["virtual_models"].keys()) or "(none — set a free API key)",
-        )
-    except Exception as exc:
-        logger.error(f"Router initialisation failed: {exc}")
+    # NOTE: keys are NOT injected into os.environ any more. A process has one
+    # environment, so that was single-tenant by construction — two users' Groq
+    # keys collided in the same variable. Keys are now decrypted per request and
+    # passed straight into litellm. See services/key_store.py.
+    #
+    # Routers are built PER USER, lazily, on first request (core/llm_router.py),
+    # so there is nothing to preload here.
+    logger.info("Routers are built per-user on demand; no global pool to preload.")
     logger.info("=" * 60)
 
     yield  # ← App is running and serving requests here
@@ -130,16 +124,23 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description=(
-        "Unified API Gateway for OpenAI, Anthropic Claude, Google Gemini, "
-        "DeepSeek, xAI Grok, NVIDIA NIM, and Ollama. "
-        "Powered by LiteLLM with smart routing, automatic fallback, "
-        "streaming, and token analytics."
+        "Multi-user LLM gateway. Bring your own provider keys; the gateway "
+        "load-balances every model you can reach across all of your keys and "
+        "providers, benching whatever gets rate-limited.\n\n"
+        "**Auth:** every endpoint needs a gateway key — click **Authorize** and "
+        "paste `Bearer sk-gw-…`. Admins seed providers (`/v1/admin/*`); users add "
+        "their own keys (`/v1/me/*`) and call `/v1/chat/completions`."
     ),
     version=settings.VERSION,
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
 )
+
+# The Swagger "Authorize" button comes from the APIKeyHeader scheme declared in
+# api/gateway_auth.py, which every /v1 route depends on. The docs PAGE stays
+# public (it is only a schema listing); the API behind it is not — every endpoint
+# still 401s without a valid gateway key.
 
 
 # ───────────────────────────────────────────────────────────────
@@ -215,27 +216,19 @@ _start_time = time.time()
 @app.get("/health", tags=["System"])
 def health_check():
     """
-    Health check endpoint. Used by Docker, load balancers, and monitoring.
+    Health check for Docker / load balancers / monitoring.
 
-    Returns:
-      - status: "healthy"
-      - uptime_seconds: how long the server has been running
-      - environment: dev/staging/prod
-      - configured_providers: list of providers with API keys set
+    Deliberately reports NO model or key information: there is no global pool any
+    more, and what is callable is per-user. Ask /v1/me/models as a user for that.
     """
-    try:
-        from app.core.llm_router import router_health
-        pool = router_health()
-    except Exception:
-        pool = {"virtual_models": {}, "total_deployments": 0, "cooling_down": []}
+    from app.core import llm_router
 
     return success_response(
         data={
             "status": "healthy",
             "uptime_seconds": round(time.time() - _start_time, 1),
             "environment": settings.ENVIRONMENT,
-            "configured_providers": settings.get_configured_providers(),
-            "router": pool,
+            **llm_router.router_health(),
         },
         message="All systems operational",
     )
@@ -257,6 +250,7 @@ app.include_router(api_router)
 app.include_router(openai_compat.router, tags=["OpenAI-compatible"])
 app.include_router(anthropic_compat.router, tags=["Anthropic-compatible"])
 app.include_router(admin.router, tags=["Admin"])
+app.include_router(me.router, tags=["Me"])
 
 
 # ───────────────────────────────────────────────────────────────

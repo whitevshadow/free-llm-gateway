@@ -12,8 +12,6 @@ env/
 .env
 .pytest_cache/
 .ruff_cache/
-*.db
-*.sqlite
 
 # NodeJS / Frontend
 node_modules/
@@ -44,3 +42,4 @@ dist-ssr/
 .claude/
 .agents/
 skills-lock.json
+.gstack/

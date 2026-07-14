@@ -32,8 +32,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app.core.config import settings
-from app.core.llm_router import get_router, list_virtual_models
-from app.api.gateway_auth import verify_gateway_key
+from sqlalchemy.orm import Session
+
+from app.core.database import get_db
+from app.core import llm_router as router_svc
+from app.api.gateway_auth import current_user
+from app.models.user import User
 
 logger = logging.getLogger("gateway.anthropic")
 
@@ -50,12 +54,25 @@ def _ensure_adapter_registered() -> None:
         litellm.adapters.append({"id": ADAPTER_ID, "adapter": AnthropicAdapter()})
 
 
-def _resolve_model(requested: str | None) -> str:
-    """Map an incoming model id (e.g. 'claude-3-5-sonnet') to a live virtual model."""
-    virtual = list_virtual_models()
-    if requested and requested in virtual:
-        return requested
-    return settings.DEFAULT_VIRTUAL_MODEL
+def _resolve_model(requested: str | None, available: list[str]) -> str:
+    """
+    Map an incoming model id (e.g. 'claude-3-5-sonnet') to one of THIS USER's models.
+
+    Claude Code sends Anthropic model names we do not serve, so an unknown name
+    falls back to the user's first available model rather than 404ing — that is
+    what makes Claude Code work against this gateway at all.
+    """
+    if not available:
+        raise HTTPException(
+            status_code=503,
+            detail="You have no callable models. Add a key via POST /v1/me/provider-keys.",
+        )
+    if requested:
+        from app.services.normalize import resolve_requested_model
+        resolved = resolve_requested_model(requested, set(available))
+        if resolved:
+            return resolved
+    return available[0]
 
 
 def _to_dict(obj: Any) -> Dict[str, Any]:
@@ -71,9 +88,13 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     return obj  # last resort; FastAPI will try to serialise it
 
 
-@router.post("/v1/messages", dependencies=[Depends(verify_gateway_key)])
-async def anthropic_messages(request: Request):
-    """Anthropic Messages API, served by the smart free-provider Router."""
+@router.post("/v1/messages")
+async def anthropic_messages(
+    request: Request,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Anthropic Messages API, served from THIS USER's live deployments."""
     _ensure_adapter_registered()
 
     try:
@@ -90,9 +111,10 @@ async def anthropic_messages(request: Request):
     # `model` is consumed by the Router for deployment selection; the adapter reads
     # the rest of the Anthropic params from kwargs.
     requested_model = body.pop("model", None)
-    model = _resolve_model(request.headers.get("x-model") or requested_model)
+    available = router_svc.list_models(user.id, db)
+    model = _resolve_model(request.headers.get("x-model") or requested_model, available)
     stream = bool(body.pop("stream", False))
-    llm_router = get_router()
+    llm_router = router_svc.get_router(user.id, db)
 
     # ── Streaming ───────────────────────────────────────
     if stream:

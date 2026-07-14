@@ -1,70 +1,99 @@
-# ─────────────────────────────────────────────────────────────
-# Multi-LLM Gateway — PostgreSQL + API gateway.
+# ─────────────────────────────────────────────────────────────────────────────
+#  Multi-LLM Gateway — the whole project in Docker. THREE services.
 #
-#   docker compose up -d --build
-#   → http://localhost:8000        OpenAI-compatible gateway (/v1, /docs)
-#   → PostgreSQL on the internal network (service: postgres)
+#      cp .env.example .env       # then fill SECRET_KEY + ENCRYPTION_KEY
+#      docker compose up -d --build
 #
-# One-off maintenance (run manually, inside the app container):
-#   docker compose exec app python -m app.scripts.migrate_sqlite_to_postgres
-#   docker compose exec app python -m app.scripts.probe_models
-# ─────────────────────────────────────────────────────────────
+#      → http://localhost:8080          the UI  (nginx)
+#      → http://localhost:8080/v1/...   the API (proxied to app)
+#      → http://localhost:8080/docs     Swagger (proxied to app)
+#
+#      docker compose logs app | grep -A2 "BOOTSTRAP ADMIN KEY"
+#        ^ your first admin key, printed ONCE. Copy it — it is unrecoverable.
+#
+#  EVERYTHING IS ONE ORIGIN. nginx serves the SPA and proxies /v1, /docs,
+#  /health to the app container, so the browser never talks to a second host.
+#  That is what lets us run with no CORS config at all.
+# ─────────────────────────────────────────────────────────────────────────────
 
 services:
 
-  # ── PostgreSQL — primary application database ────────────────
+  # ── PostgreSQL — the ONLY supported database ───────────────────────────────
+  #  Not swappable for SQLite. The schema relies on generated columns, plpgsql
+  #  triggers, native enums, composite foreign keys and views — none of which
+  #  SQLite has. Those are not decorations: the composite FKs are what make it
+  #  impossible for one user's request to be billed to another user's API key.
+  #  The app refuses to boot on a sqlite:// URL rather than silently dropping
+  #  those guarantees.
   postgres:
     image: postgres:16-alpine
     environment:
-      - POSTGRES_USER=gateway
-      - POSTGRES_PASSWORD=gateway
-      - POSTGRES_DB=gateway
+      POSTGRES_USER: ${POSTGRES_USER:-gateway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gateway}
+      POSTGRES_DB: ${POSTGRES_DB:-gateway}
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gateway} -d ${POSTGRES_DB:-gateway}"]
       interval: 5s
       timeout: 5s
       retries: 12
       start_period: 5s
     restart: unless-stopped
+    # Not published: only `app` needs it. Uncomment to reach it with psql.
+    # ports:
+    #   - "5432:5432"
 
-  # ── LiteLLM Smart Router + FastAPI Backend (API only) ───────
+  # ── app — FastAPI + LiteLLM. API only; it serves no HTML. ─────────────────
   app:
     build:
-      context: ./backend
-    image: multi-llm-gateway
-    ports:
-      - "8000:8000"
-    env_file:
-      - ./backend/.env
+      context: .              # repo root: needs backend/schema.sql
+      dockerfile: Dockerfile
+    image: multi-llm-gateway-api
     environment:
-      - HOST=0.0.0.0
-      - PORT=8000
-      # Primary DB is now PostgreSQL. `postgres` resolves on the compose network.
-      - DATABASE_URL=postgresql+psycopg2://gateway:gateway@postgres:5432/gateway
-      # Serve the common-model spine (populated by the discover/probe/derive
-      # pipeline). Set to 'yaml' to fall back to the static bootstrap pool.
-      - ROUTER_SOURCE=${ROUTER_SOURCE:-db}
-      # Gateway auth for the public /v1 API. Values come from the root .env.
-      - REQUIRE_GATEWAY_AUTH=${REQUIRE_GATEWAY_AUTH:-true}
-      - GATEWAY_API_KEY=${GATEWAY_API_KEY}
-    volumes:
-      # Keep the old SQLite volume mounted so its data can be migrated across.
-      - app_data:/app/data
-      # Live-mount the model pool so YAML tweaks apply on a router reload (no rebuild).
-      - ./backend/config:/app/config:ro
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD:-gateway}@postgres:5432/${POSTGRES_DB:-gateway}
+
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      # Encrypts users' provider keys at rest. If this ever changes, every stored
+      # provider key becomes undecryptable. Set it once and back it up.
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?set ENCRYPTION_KEY in .env}
+
+      OWNER_EMAIL: ${OWNER_EMAIL:-admin@localhost}
+      REQUIRE_GATEWAY_AUTH: ${REQUIRE_GATEWAY_AUTH:-true}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DEBUG: ${DEBUG:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-120}
+
+      # The browser reaches the API through nginx on the SAME origin, so no
+      # cross-origin request is ever made and CORS is moot.
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+
+      # NOTE: there are deliberately NO provider API keys here (no GROQ_API_KEY,
+      # no NVIDIA_API_KEY). An env var is process-global, so a key set here would
+      # be shared by every user — the exact bug the multi-user design removed.
+      # Users add their OWN keys in the UI; each is encrypted and scoped to them.
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
+    # Not published. The ONLY way in is through nginx — so there is no second,
+    # unproxied door onto the API. Uncomment to hit uvicorn directly while debugging.
+    # ports:
+    #   - "8000:8000"
+
+  # ── web — nginx: serves the SPA, proxies the API ──────────────────────────
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: multi-llm-gateway-web
+    ports:
+      - "${PORT:-8080}:80"
+    depends_on:
+      app:
+        condition: service_started
+    restart: unless-stopped
 
 volumes:
-  app_data:
   pg_data:

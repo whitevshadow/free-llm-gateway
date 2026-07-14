@@ -1,17 +1,20 @@
 """
-OpenAI-compatible endpoints — `/v1/chat/completions`, `/v1/embeddings` and
-`/v1/models`.
+OpenAI-compatible endpoints — `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`.
 
-This is the drop-in surface for *any* OpenAI client (the OpenAI SDK, Cursor,
-Continue, LangChain, plain curl, ...). Point the client at this gateway:
+Drop-in surface for any OpenAI client (the OpenAI SDK, Cursor, Continue,
+LangChain, curl):
 
     base_url = "http://localhost:8000/v1"
-    api_key  = "<GATEWAY_API_KEY>"        # or anything if auth is disabled
-    model    = "auto"                      # or gpt-oss-120b, deepseek, qwen, ...
+    api_key  = "<GATEWAY_KEY>"       # identifies WHICH USER you are
+    model    = "gpt-oss-120b"        # the bare family name
 
-Requests are handed straight to the smart Router, which load-balances across free
-keys/providers and cools down anything that hits a 429. Because LiteLLM already
-speaks OpenAI's schema natively, the response is passed through unchanged.
+EVERY REQUEST IS SCOPED TO THE CALLER. The gateway key resolves to a User, and the
+Router is built from THAT USER'S live deployments with THEIR keys. Two users
+calling the same model name hit different upstream accounts. There is no shared
+Router and no shared key namespace.
+
+Clients send the BARE FAMILY NAME ('gpt-oss-120b'); litellm load-balances every
+deployment registered under it — across both the user's keys and their providers.
 """
 
 from __future__ import annotations
@@ -19,31 +22,22 @@ from __future__ import annotations
 import json
 import time
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
 
-from app.core.config import settings
-from app.core.llm_router import get_router, list_virtual_models
-from app.api.gateway_auth import verify_gateway_key
+from app.core.database import get_db
+from app.core import llm_router as router_svc
+from app.api.gateway_auth import current_user
+from app.models.user import User
+from app.services.normalize import resolve_requested_model
 from app.services.usage_logger import log_v1_usage
 
 logger = logging.getLogger("gateway.openai")
 
 router = APIRouter()
-
-# Virtual model /v1/embeddings falls back to when the requested model is
-# unknown (e.g. a client default like "text-embedding-3-small").
-DEFAULT_EMBEDDING_MODEL = "embed"
-
-
-def _resolve_model(requested: str | None) -> str:
-    """Map an incoming model id to a live virtual model, else the default."""
-    virtual = list_virtual_models()
-    if requested and requested in virtual:
-        return requested
-    return settings.DEFAULT_VIRTUAL_MODEL
 
 
 def _to_dict(obj: Any) -> Dict[str, Any]:
@@ -60,20 +54,46 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     return json.loads(getattr(obj, "json", lambda: "{}")())
 
 
-@router.get("/v1/models", dependencies=[Depends(verify_gateway_key)])
-async def list_models():
-    """List the virtual models the gateway exposes (OpenAI `/v1/models` shape)."""
+def _deployment_id(response: Any) -> Optional[int]:
+    """
+    Pull our deployment id back out of the litellm response.
+
+    We stamped it into model_info when building the model_list, which is what lets
+    us attribute a call — and a failure — to the exact (model, key) row.
+    """
+    try:
+        info = getattr(response, "_hidden_params", {}) or {}
+        raw = info.get("model_id")
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+@router.get("/v1/models")
+async def list_models(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """
+    The models THIS USER can call — not a global list.
+
+    A user who holds no keys sees an empty list, which is correct: they cannot
+    call anything.
+    """
     now = int(time.time())
-    data = [
-        {"id": name, "object": "model", "created": now, "owned_by": "free-gateway"}
-        for name in list_virtual_models()
-    ]
-    return {"object": "list", "data": data}
+    return {
+        "object": "list",
+        "data": [
+            {"id": name, "object": "model", "created": now, "owned_by": "gateway"}
+            for name in router_svc.list_models(user.id, db)
+        ],
+    }
 
 
-@router.post("/v1/chat/completions", dependencies=[Depends(verify_gateway_key)])
-async def chat_completions(request: Request):
-    """OpenAI chat-completions, served by the smart free-provider Router."""
+@router.post("/v1/chat/completions")
+async def chat_completions(
+    request: Request,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Chat completions, served from THIS USER's live deployments."""
     try:
         body: Dict[str, Any] = await request.json()
     except Exception:
@@ -82,43 +102,64 @@ async def chat_completions(request: Request):
     if not body.get("messages"):
         raise HTTPException(status_code=400, detail="'messages' is required.")
 
-    requested_model = body.get("model")
-    body["model"] = _resolve_model(requested_model)
+    requested = body.get("model")
+    available = router_svc.list_models(user.id, db)
+    if not available:
+        raise HTTPException(
+            status_code=503,
+            detail="You have no callable models. Add a provider key via POST /v1/me/provider-keys.",
+        )
+    resolved = resolve_requested_model(requested or "", set(available))
+    if not resolved:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model {requested!r} is not available to you. Yours: {available}",
+        )
+    body["model"] = resolved
+
     stream = bool(body.pop("stream", False))
-    llm_router = get_router()
+    lr = router_svc.get_router(user.id, db)
     start = time.perf_counter()
 
-    # ── Streaming ───────────────────────────────────────
     if stream:
         async def event_stream():
             try:
-                response = await llm_router.acompletion(**body, stream=True)
+                response = await lr.acompletion(**body, stream=True)
                 async for chunk in response:
                     yield f"data: {json.dumps(_to_dict(chunk))}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as exc:
-                logger.warning("v1 stream error: %s", exc)
+                logger.warning("stream error (user %s): %s", user.id, exc)
                 err = {"error": {"message": str(exc), "type": "gateway_error"}}
                 yield f"data: {json.dumps(err)}\n\n"
                 yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    # ── Standard ────────────────────────────────────────
     try:
-        response = await llm_router.acompletion(**body)
+        response = await lr.acompletion(**body)
     except Exception as exc:
         latency = round(time.perf_counter() - start, 3)
         log_v1_usage(
-            model=body["model"], latency=latency, status_code=502,
-            error_message=str(exc),
+            user_id=user.id, requested_model=requested, latency=latency,
+            status_code=502, error_message=str(exc),
         )
-        logger.warning("v1 completion failed: %s", exc)
+        logger.warning("completion failed (user %s): %s", user.id, exc)
         raise HTTPException(status_code=502, detail=str(exc))
 
     result = _to_dict(response)
+    dep_id = _deployment_id(response)
+
+    # Write the outcome back to Postgres — the durable truth. Without this a live
+    # 429 would exist only in litellm's memory: invisible to the dashboard, to
+    # other workers, and lost on restart.
+    if dep_id:
+        router_svc.record_success(dep_id)
+
     log_v1_usage(
-        model=result.get("model", body["model"]),
+        user_id=user.id,
+        requested_model=requested,
+        answered_deploy_id=dep_id,
         usage=result.get("usage"),
         latency=round(time.perf_counter() - start, 3),
         status_code=200,
@@ -126,15 +167,13 @@ async def chat_completions(request: Request):
     return result
 
 
-@router.post("/v1/embeddings", dependencies=[Depends(verify_gateway_key)])
-async def embeddings(request: Request):
-    """
-    OpenAI embeddings, served by the free NVIDIA NIM embedding pool.
-
-    NVIDIA's retrieval models are asymmetric: the pool defaults to
-    `input_type: query`; pass `"input_type": "passage"` in the body when
-    embedding documents for an index.
-    """
+@router.post("/v1/embeddings")
+async def embeddings(
+    request: Request,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Embeddings, served from THIS USER's live embedding deployments."""
     try:
         body: Dict[str, Any] = await request.json()
     except Exception:
@@ -143,37 +182,34 @@ async def embeddings(request: Request):
     if not body.get("input"):
         raise HTTPException(status_code=400, detail="'input' is required.")
 
-    virtual = list_virtual_models()
     requested = body.get("model")
-    if requested in virtual:
-        body["model"] = requested
-    elif DEFAULT_EMBEDDING_MODEL in virtual:
-        body["model"] = DEFAULT_EMBEDDING_MODEL
-    else:
+    available = router_svc.list_models(user.id, db)
+    resolved = resolve_requested_model(requested or "", set(available))
+    if not resolved:
         raise HTTPException(
-            status_code=503,
-            detail=(
-                "No embedding deployment is configured — set NVIDIA_API_KEY_1 "
-                "in .env to activate the free NVIDIA embedding models."
-            ),
+            status_code=404,
+            detail=f"Embedding model {requested!r} is not available to you. Yours: {available}",
         )
+    body["model"] = resolved
 
-    llm_router = get_router()
+    lr = router_svc.get_router(user.id, db)
     start = time.perf_counter()
     try:
-        response = await llm_router.aembedding(**body)
+        response = await lr.aembedding(**body)
     except Exception as exc:
-        latency = round(time.perf_counter() - start, 3)
         log_v1_usage(
-            model=body["model"], latency=latency, status_code=502,
-            error_message=str(exc),
+            user_id=user.id, requested_model=requested,
+            latency=round(time.perf_counter() - start, 3),
+            status_code=502, error_message=str(exc),
         )
-        logger.warning("v1 embeddings failed: %s", exc)
+        logger.warning("embeddings failed (user %s): %s", user.id, exc)
         raise HTTPException(status_code=502, detail=str(exc))
 
     result = _to_dict(response)
     log_v1_usage(
-        model=result.get("model") or body["model"],
+        user_id=user.id,
+        requested_model=requested,
+        answered_deploy_id=_deployment_id(response),
         usage=result.get("usage"),
         latency=round(time.perf_counter() - start, 3),
         status_code=200,

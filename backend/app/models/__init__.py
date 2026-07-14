@@ -1,45 +1,67 @@
 """
-ORM model registry — the single consolidated data model (see DATA_MODEL.md).
+ORM model registry.
 
-Eleven tables: users + gateway_api_keys + providers + provider_keys (encrypted)
-+ provider_models + master_model + deployments + common_model +
-common_model_members + request_logs + router_config.
+EIGHT TABLES, mapping onto backend/schema.sql — which is the SOURCE OF TRUTH.
+These classes describe the database; they do not generate it. `create_all()` is
+not used, because it cannot emit the triggers, functions and views the schema
+depends on.
+
+  GLOBAL CATALOG (admin-seeded, no user scope)
+    Provider ──► ProviderModel
+
+  PER-USER
+    User ──► GatewayApiKey                (tokens clients present TO us)
+         └─► ProviderKey ──┐              (the user's OWN upstream secrets)
+                           ├──► Deployment  (the atomic callable unit)
+         ProviderModel ────┘
+
+    RequestLog, RouterConfig
+
+REMOVED in the multi-user rewrite — do not re-add:
+  MasterModel         per-user model rollup; Deployment already is it.
+  CommonModel         replaced by ProviderModel.is_common (a flag, not a table).
+  CommonModelMember   the fallback chain; there is no ordering any more.
+
+Read-only views live in app.models.views (v_my_models, v_live_deployments) — use
+those to route or to show a user their models, never Deployment directly.
 """
 
 from app.core.database import Base
 
-# ── Identity ────────────────────────────────────────────────────────────────
-from app.models.user import User
-
 # ── Enums ───────────────────────────────────────────────────────────────────
 from app.models.enums import ModelHealth, ModelMode
 
-# ── Common-model routing spine ──────────────────────────────────────────────
-from app.models.provider import Provider
+# ── Identity + RBAC ─────────────────────────────────────────────────────────
+from app.models.user import User
 from app.models.gateway_api_key import GatewayApiKey
-from app.models.provider_api_key import ProviderApiKey
-from app.models.provider_model import ProviderModel
-from app.models.master_model import MasterModel
-from app.models.deployment import Deployment
-from app.models.common_model import CommonModel, CommonModelMember
-from app.models.request_log import RequestLog
 
-# ── Router behaviour (single-row settings) ──────────────────────────────────
-from app.models.model_pool import RouterConfig
+# ── Global catalog ──────────────────────────────────────────────────────────
+from app.models.provider import Provider
+from app.models.provider_model import ProviderModel
+
+# ── Per-user ────────────────────────────────────────────────────────────────
+from app.models.provider_key import ProviderKey
+from app.models.deployment import Deployment
+
+# ── Ledger + router behaviour ───────────────────────────────────────────────
+from app.models.request_log import RequestLog
+from app.models.router_config import RouterConfig
+
+# ── Read-only views ─────────────────────────────────────────────────────────
+from app.models.views import v_my_models, v_live_deployments
 
 __all__ = [
     "Base",
-    "User",
     "ModelHealth",
     "ModelMode",
-    "Provider",
+    "User",
     "GatewayApiKey",
-    "ProviderApiKey",
+    "Provider",
     "ProviderModel",
-    "MasterModel",
+    "ProviderKey",
     "Deployment",
-    "CommonModel",
-    "CommonModelMember",
     "RequestLog",
     "RouterConfig",
+    "v_my_models",
+    "v_live_deployments",
 ]

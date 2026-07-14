@@ -1,653 +1,245 @@
 """
-LLM Router — the smart-switching core of the gateway.
+LLM Router — ONE ROUTER PER USER, built from that user's live deployments.
 
-WHAT THIS IS:
-  A thin wrapper that builds a single `litellm.Router` from the YAML model pool
-  (config/model_pool.yaml). The Router is the engine that makes many limited free
-  tiers behave like one "unlimited" provider:
+WHAT CHANGED AND WHY:
 
-    • Load balancing  — rotates across every deployment of a virtual model
-                        (multiple keys + multiple providers serving the same model).
-    • Cooldowns       — a deployment that returns 429 / quota errors is benched for
-                        `cooldown_time` seconds; traffic shifts to the rest.
-    • Retries         — `num_retries` automatic retries across deployments.
-    • Fallbacks       — when a whole virtual model is exhausted, cascade to the
-                        next virtual model defined in `router_settings.fallbacks`.
+The old router was a module-level SINGLETON whose keys came from os.environ. That
+is single-tenant by construction: a process has one environment, so two users with
+Groq keys collide in the same variable and whoever wrote last serves everyone.
+There is no patch for that — the object itself had the wrong shape.
 
-WHY A SINGLETON:
-  The Router holds in-memory state (per-deployment usage counters, cooldown cache).
-  Every request must share the SAME instance or that state is meaningless. We build
-  it once, lazily, on first use.
+Now each user gets their own Router, built from `v_live_deployments` (their
+callable deployments only), with each key DECRYPTED AND PASSED IN as api_key on
+its own model_list entry. No shared namespace, so no cross-user leakage.
 
-KEY RESOLUTION & FILTERING:
-  Deployments reference keys as `os.environ/<VAR>`. At load time we resolve those
-  references and DROP any deployment whose key is unset — so the live pool reflects
-  only the free accounts you've actually configured. Add a key in .env, restart,
-  and that deployment joins the pool automatically.
+WHERE THE TRUTH LIVES — this is the part to keep straight:
+
+    POSTGRES is durable truth.  Which deployments exist, and their health and
+                               cooldowns, live in the DB. The probe writes them;
+                               is_callable() decides what is live right now.
+
+    THE ROUTER is a short-lived VIEW of that truth. LiteLLM keeps its own
+                               in-memory cooldown/usage state, which necessarily
+                               duplicates the DB's. We keep the two from drifting
+                               by giving each Router a short TTL and rebuilding
+                               it from the view — so a DB cooldown that expires
+                               shows up within TTL_SECONDS, and a 429 seen in
+                               flight is ALSO written back to the DB (see
+                               record_failure) rather than living only in memory.
+
+If those two ever seem to disagree, the DB is right and the Router is stale.
 """
 
 from __future__ import annotations
 
-import os
 import logging
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-import yaml
 import litellm
 from litellm import Router
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.database import SessionLocal
+from app.models.deployment import Deployment
+from app.models.enums import ModelHealth
+from app.models.provider import Provider
+from app.models.provider_key import ProviderKey
+from app.models.router_config import RouterConfig
+from app.models.views import v_live_deployments
+from app.services import crypto
 
 logger = logging.getLogger("gateway.router")
 
-BACKEND_ROOT = Path(__file__).resolve().parents[2]
+# How long a built Router may be reused before it is rebuilt from the DB. This is
+# the maximum staleness of the in-memory view: a cooldown that expires in Postgres
+# becomes callable again within this window.
+TTL_SECONDS = 30
 
-_ENV_PREFIX = "os.environ/"
-
-# Module-level singletons (populated by get_router()).
-_router: Optional[Router] = None
-_virtual_models: List[str] = []
-
-
-# ───────────────────────────────────────────────────────────────
-# YAML LOADING + KEY RESOLUTION
-# ───────────────────────────────────────────────────────────────
-
-def _pool_path() -> Path:
-    """Resolve MODEL_POOL_PATH against the backend root if it's relative."""
-    p = Path(settings.MODEL_POOL_PATH)
-    return p if p.is_absolute() else (BACKEND_ROOT / p)
+# user_id -> (router, built_at, model_names)
+_cache: Dict[int, Tuple[Router, float, List[str]]] = {}
 
 
-def _resolve_env_ref(value: Any) -> Optional[str]:
+def _router_settings(db: Session, user_id: int) -> Dict[str, Any]:
+    rc = db.query(RouterConfig).filter(RouterConfig.user_id == user_id).first()
+    if not rc:
+        return {"routing_strategy": "usage-based-routing-v2", "num_retries": 4,
+                "cooldown_time": 30, "allowed_fails": 3}
+    return {
+        "routing_strategy": rc.routing_strategy,
+        "num_retries": rc.num_retries,
+        "cooldown_time": rc.cooldown_time,
+        "allowed_fails": rc.allowed_fails,
+    }
+
+
+def _build(db: Session, user_id: int) -> Tuple[Router, List[str]]:
     """
-    Resolve a possible `os.environ/<VAR>` reference.
+    Build a Router from this user's CALLABLE deployments.
 
-    Returns the resolved string, or None if it referenced an unset/empty var.
-    Non-reference values are returned unchanged.
+    The view already excludes revoked keys, disabled models, and deployments still
+    cooling down — and it already RE-INCLUDES ones whose cooldown expired. So the
+    model_list is exactly "what this user can call right now".
     """
-    if isinstance(value, str) and value.startswith(_ENV_PREFIX):
-        var = value[len(_ENV_PREFIX):]
-        resolved = os.environ.get(var)
-        return resolved or None
-    return value
+    rows = db.execute(
+        select(v_live_deployments).where(v_live_deployments.c.user_id == user_id)
+    ).mappings().all()
+
+    # Decrypt each key once, not once per deployment.
+    key_ids = {r["provider_key_id"] for r in rows}
+    plaintext: Dict[int, str] = {}
+    if key_ids:
+        for pk in db.query(ProviderKey).filter(ProviderKey.id.in_(key_ids)):
+            plaintext[pk.id] = crypto.decrypt(pk.key_ciphertext)
+
+    bases = {p.id: p.base_url for p in db.query(Provider)}
+
+    model_list: List[Dict[str, Any]] = []
+    for r in rows:
+        params: Dict[str, Any] = {
+            "model": r["litellm_model"],
+            "api_key": plaintext[r["provider_key_id"]],   # passed in, never os.environ
+        }
+        base = bases.get(r["provider_id"])
+        if base:
+            params["api_base"] = base
+        if r["rpm"]:
+            params["rpm"] = r["rpm"]
+
+        model_list.append({
+            # The client asks for the bare family name; litellm load-balances
+            # every deployment registered under it — across BOTH keys and providers.
+            "model_name": r["model"],
+            "litellm_params": params,
+            # Carry our deployment id through, so a failure can be attributed back
+            # to the exact (model, key) row and written to the DB.
+            "model_info": {"id": str(r["deployment_id"]),
+                           "deployment_id": r["deployment_id"]},
+        })
+
+    litellm.request_timeout = settings.REQUEST_TIMEOUT
+    router = Router(
+        model_list=model_list,
+        timeout=settings.REQUEST_TIMEOUT,
+        **_router_settings(db, user_id),
+    )
+    names = sorted({d["model_name"] for d in model_list})
+    logger.info(
+        "Router built for user %s: %d deployment(s) across %d model(s).",
+        user_id, len(model_list), len(names),
+    )
+    return router, names
 
 
-def _load_pool_from_yaml() -> Dict[str, Any]:
-    """Read and parse the YAML pool file. Returns {} if it doesn't exist."""
-    path = _pool_path()
-    if not path.exists():
-        logger.error("Model pool file not found at %s", path)
-        return {}
-    with open(path, "r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh) or {}
+def get_router(user_id: int, db: Optional[Session] = None) -> Router:
+    """The user's Router, rebuilt if older than TTL_SECONDS."""
+    hit = _cache.get(user_id)
+    if hit and (time.monotonic() - hit[1]) < TTL_SECONDS:
+        return hit[0]
 
-
-def _load_pool_from_db() -> Optional[Dict[str, Any]]:
-    """
-    DB-backed model list (legacy model_deployments) was removed in the single-model
-    consolidation. The DB-driven pool is rebuilt from the common-model spine
-    (provider_models → master_model → deployments → common_model) in Phase 6.
-
-    Until then this returns None so `_load_pool` falls back to the YAML bootstrap.
-    """
-    return None
-
-
-def _load_pool() -> Dict[str, Any]:
-    """
-    Load the curated pool from the configured source (see settings.MODEL_POOL_SOURCE):
-      • auto → Postgres if it has deployments, else the YAML file
-      • db   → Postgres only
-      • yaml → the YAML file only
-    """
-    source = (settings.MODEL_POOL_SOURCE or "auto").lower()
-
-    if source in ("auto", "db"):
-        db_pool = _load_pool_from_db()
-        if db_pool and db_pool.get("model_list"):
-            return db_pool
-        if source == "db":
-            logger.warning("MODEL_POOL_SOURCE=db but no deployments found in the DB.")
-            return db_pool or {}
-
-    return _load_pool_from_yaml()
-
-
-def _build_model_list(raw_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Resolve env references and keep only usable deployments.
-
-    A deployment is kept when:
-      • it has an `api_key` that resolves to a non-empty value, OR
-      • it has no `api_key` at all (keyless local providers like Ollama).
-    Deployments referencing an unset key are silently dropped.
-    """
-    usable: List[Dict[str, Any]] = []
-    dropped = 0
-
-    for entry in raw_list:
-        params = dict(entry.get("litellm_params", {}))
-        name = entry.get("model_name", "?")
-
-        # api_base may reference env too (e.g. Ollama) — resolve but don't require.
-        if "api_base" in params:
-            resolved_base = _resolve_env_ref(params["api_base"])
-            if resolved_base:
-                params["api_base"] = resolved_base
-            else:
-                params.pop("api_base", None)
-
-        if "api_key" in params:
-            resolved_key = _resolve_env_ref(params["api_key"])
-            if not resolved_key:
-                dropped += 1
-                continue
-            params["api_key"] = resolved_key
-
-        usable.append({**entry, "litellm_params": params})
-
-    if dropped:
-        logger.info("Skipped %d deployment(s) with missing API keys.", dropped)
-    return usable
-
-
-# ───────────────────────────────────────────────────────────────
-# NVIDIA AUTO-DISCOVERY
-# ───────────────────────────────────────────────────────────────
-# When a NVIDIA key is set, pull NVIDIA's full model catalog and register every
-# chat model as a callable deployment (model_name == the NVIDIA id, e.g.
-# "meta/llama-3.3-70b-instruct"). Non-chat models (embeddings, rerankers, OCR)
-# are skipped since they can't serve chat completions.
-
-_NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
-# Substrings that mark a model as non-chat — excluded from the pool.
-_NVIDIA_NON_CHAT = ("embed", "rerank", "-ocr", "ocrnet", "retrieval", "/bge-")
-_nvidia_cache: Dict[str, Any] = {"sig": None, "models": []}
-
-
-def _nvidia_keys() -> List[str]:
-    """All NVIDIA key values currently in the environment (supports rotation)."""
-    keys: List[str] = []
-    for name, value in os.environ.items():
-        if not value:
-            continue
-        if (
-            name == "NVIDIA_API_KEY" or name.startswith("NVIDIA_API_KEY_")
-            or name == "NVIDIA_NIM_API_KEY" or name.startswith("NVIDIA_NIM_API_KEY_")
-        ):
-            keys.append(value)
-    return keys
-
-
-def _fetch_nvidia_model_ids(keys: List[str]) -> List[str]:
-    """Fetch + cache the list of NVIDIA chat model ids. Returns [] on any failure."""
-    sig = tuple(sorted({k[-6:] for k in keys}))
-    if _nvidia_cache["sig"] == sig:
-        return _nvidia_cache["models"]
-
-    ids: List[str] = []
+    owns = db is None
+    db = db or SessionLocal()
     try:
-        import httpx
-        headers = {"Authorization": f"Bearer {keys[0]}"} if keys else {}
-        resp = httpx.get(_NVIDIA_MODELS_URL, headers=headers, timeout=15)
-        resp.raise_for_status()
-        for item in resp.json().get("data", []):
-            mid = item.get("id", "")
-            if mid and not any(tok in mid.lower() for tok in _NVIDIA_NON_CHAT):
-                ids.append(mid)
-    except Exception as exc:  # network/parse failure — degrade gracefully
-        logger.warning("NVIDIA model discovery failed: %s", exc)
-
-    _nvidia_cache.update({"sig": sig, "models": ids})
-    return ids
+        router, names = _build(db, user_id)
+        _cache[user_id] = (router, time.monotonic(), names)
+        return router
+    finally:
+        if owns:
+            db.close()
 
 
-def _nvidia_discovered_deployments(existing_names: set) -> List[Dict[str, Any]]:
-    """Build a deployment per (discovered NVIDIA model, key), skipping duplicates."""
-    if not settings.NVIDIA_AUTO_DISCOVER:
-        return []
-    keys = _nvidia_keys()
-    if not keys:
-        return []
-
-    deployments: List[Dict[str, Any]] = []
-    model_ids = [m for m in _fetch_nvidia_model_ids(keys) if m not in existing_names]
-    for mid in model_ids:
-        for key in keys:
-            deployments.append(
-                {
-                    "model_name": mid,
-                    "litellm_params": {"model": f"nvidia_nim/{mid}", "api_key": key},
-                }
-            )
-    if model_ids:
-        logger.info("NVIDIA auto-discovery: registered %d chat model(s).", len(model_ids))
-    return deployments
-
-
-# ───────────────────────────────────────────────────────────────
-# OPENROUTER AUTO-DISCOVERY
-# ───────────────────────────────────────────────────────────────
-# When an OpenRouter key is set, pull OpenRouter's catalog and register every
-# model as a callable deployment (model_name == the OpenRouter id, e.g.
-# "deepseek/deepseek-r1:free"). By default only free models are kept.
-
-_OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
-_openrouter_cache: Dict[str, Any] = {"sig": None, "models": []}
-
-
-def _openrouter_keys() -> List[str]:
-    """All OpenRouter key values currently in the environment (supports rotation)."""
-    keys: List[str] = []
-    for name, value in os.environ.items():
-        if not value:
-            continue
-        if name == "OPENROUTER_API_KEY" or name.startswith("OPENROUTER_API_KEY_"):
-            keys.append(value)
-    return keys
-
-
-def _is_free_openrouter(item: Dict[str, Any]) -> bool:
-    """True if an OpenRouter catalog entry is free (":free" id or zero-priced)."""
-    mid = item.get("id", "")
-    if mid.endswith(":free"):
-        return True
-    pricing = item.get("pricing", {}) or {}
-    def _zero(v: Any) -> bool:
-        try:
-            return float(v) == 0.0
-        except (TypeError, ValueError):
-            return False
-    return _zero(pricing.get("prompt", "0")) and _zero(pricing.get("completion", "0"))
-
-
-def _fetch_openrouter_model_ids(keys: List[str]) -> List[str]:
-    """Fetch + cache the list of OpenRouter model ids. Returns [] on any failure."""
-    sig = tuple(sorted({k[-6:] for k in keys}))
-    if _openrouter_cache["sig"] == sig:
-        return _openrouter_cache["models"]
-
-    ids: List[str] = []
-    try:
-        import httpx
-        headers = {"Authorization": f"Bearer {keys[0]}"} if keys else {}
-        resp = httpx.get(_OPENROUTER_MODELS_URL, headers=headers, timeout=15)
-        resp.raise_for_status()
-        for item in resp.json().get("data", []):
-            mid = item.get("id", "")
-            if not mid:
-                continue
-            if settings.OPENROUTER_FREE_ONLY and not _is_free_openrouter(item):
-                continue
-            ids.append(mid)
-    except Exception as exc:  # network/parse failure — degrade gracefully
-        logger.warning("OpenRouter model discovery failed: %s", exc)
-
-    _openrouter_cache.update({"sig": sig, "models": ids})
-    return ids
-
-
-def _openrouter_discovered_deployments(existing_names: set) -> List[Dict[str, Any]]:
-    """Build a deployment per (discovered OpenRouter model, key), skipping duplicates."""
-    if not settings.OPENROUTER_AUTO_DISCOVER:
-        return []
-    keys = _openrouter_keys()
-    if not keys:
-        return []
-
-    deployments: List[Dict[str, Any]] = []
-    model_ids = [m for m in _fetch_openrouter_model_ids(keys) if m not in existing_names]
-    for mid in model_ids:
-        for key in keys:
-            deployments.append(
-                {
-                    "model_name": mid,
-                    "litellm_params": {"model": f"openrouter/{mid}", "api_key": key},
-                }
-            )
-    if model_ids:
-        logger.info("OpenRouter auto-discovery: registered %d model(s).", len(model_ids))
-    return deployments
-
-
-# ───────────────────────────────────────────────────────────────
-# ROUTER CONSTRUCTION
-# ───────────────────────────────────────────────────────────────
-
-def _build_from_db() -> Optional[Dict[str, Any]]:
+def invalidate(user_id: Optional[int] = None) -> None:
     """
-    Build the pool from the common-model spine (Phase 6).
+    Drop a cached Router so the next request rebuilds it.
 
-    For each active common_model, register every WORKING per-key deployment of its
-    members. The priority-0 member's deployments share the common name (Level-1
-    per-key load balancing); higher-priority members go under `<name>##fbN` names
-    referenced by an ordered fallbacks list (Level-2 cross-provider cascade).
-
-    Returns {"model_list", "router_settings"} or None if the spine is empty.
+    Call after anything that changes what a user can call: adding or deleting a
+    key, a probe finishing, a catalog refresh. Without this, a new key would not
+    be usable until the TTL lapsed.
     """
-    try:
-        from app.core.database import SessionLocal
-        from app.models.common_model import CommonModel, CommonModelMember
-        from app.models.deployment import Deployment
-        from app.models.provider_api_key import ProviderApiKey
-        from app.models.model_pool import RouterConfig
-    except Exception as exc:  # pragma: no cover
-        logger.warning("DB router source unavailable (%s).", exc)
-        return None
+    if user_id is None:
+        _cache.clear()
+    else:
+        _cache.pop(user_id, None)
+
+
+def list_models(user_id: int, db: Optional[Session] = None) -> List[str]:
+    """The bare family names this user can currently call — powers GET /v1/models."""
+    get_router(user_id, db)          # ensure built/fresh
+    hit = _cache.get(user_id)
+    return list(hit[2]) if hit else []
+
+
+def record_failure(deployment_id: int, exc: Exception) -> None:
+    """
+    Write an in-flight failure back to Postgres.
+
+    Without this, a 429 hit during a real request would live ONLY in litellm's
+    in-memory cooldown cache — invisible to the DB, to other workers, and to the
+    dashboard, and lost on restart. The DB is the durable truth; this is what
+    keeps it that way.
+    """
+    from app.services.prober import _classify, RATE_LIMIT_COOLDOWN
+
+    status, code, msg = _classify(exc)
+    now = datetime.now(timezone.utc)
 
     db = SessionLocal()
     try:
-        commons = db.query(CommonModel).filter(CommonModel.is_active.is_(True)).all()
-        if not commons:
-            return None
-
-        model_list: List[Dict[str, Any]] = []
-        fallbacks: List[Dict[str, Any]] = []
-        key_slot = {k.id: k.env_slot for k in db.query(ProviderApiKey).all()}
-
-        for cm in commons:
-            members = (
-                db.query(CommonModelMember)
-                .filter(CommonModelMember.common_model_id == cm.id)
-                .order_by(CommonModelMember.priority)
-                .all()
-            )
-            fb_names: List[str] = []
-            for member in members:
-                name = cm.name if member.priority == 0 else f"{cm.name}##fb{member.priority}"
-                deps = (
-                    db.query(Deployment)
-                    .filter(Deployment.master_model_id == member.master_model_id,
-                            Deployment.is_working.is_(True))
-                    .all()
-                )
-                if not deps:
-                    continue
-                if member.priority > 0:
-                    fb_names.append(name)
-                for d in deps:
-                    params: Dict[str, Any] = {"model": d.litellm_model}
-                    slot = key_slot.get(d.provider_key_id)
-                    if slot:
-                        params["api_key"] = f"{_ENV_PREFIX}{slot}"
-                    model_list.append({"model_name": name, "litellm_params": params})
-            if fb_names:
-                fallbacks.append({cm.name: fb_names})
-
-        rc = db.query(RouterConfig).first()
-        router_settings: Dict[str, Any] = {"fallbacks": fallbacks}
-        if rc:
-            for k, v in (("routing_strategy", rc.routing_strategy), ("num_retries", rc.num_retries),
-                         ("cooldown_time", rc.cooldown_time), ("allowed_fails", rc.allowed_fails)):
-                if v is not None:
-                    router_settings[k] = v
-        return {"model_list": model_list, "router_settings": router_settings}
+        dep = db.query(Deployment).filter(Deployment.id == deployment_id).first()
+        if not dep:
+            return
+        dep.status = status
+        dep.http_code = code
+        dep.error = msg[:500]
+        dep.last_checked_at = now
+        dep.cooldown_until = (
+            now + timedelta(seconds=RATE_LIMIT_COOLDOWN)
+            if status is ModelHealth.rate_limited else None
+        )
+        db.commit()
+        invalidate(dep.user_id)
+        logger.info("Deployment %s marked %s from a live request.", deployment_id, status.value)
+    except Exception as exc2:  # never let bookkeeping break a completion
+        logger.warning("Could not record failure for deployment %s: %s", deployment_id, exc2)
     finally:
         db.close()
 
 
-def _build_router() -> Router:
-    global _virtual_models
-
-    use_db = (settings.ROUTER_SOURCE or "yaml").lower() == "db"
-    db_pool = _build_from_db() if use_db else None
-
-    if db_pool is not None:
-        raw_list = db_pool.get("model_list", []) or []
-        router_settings = dict(db_pool.get("router_settings", {}) or {})
-        model_list = _build_model_list(raw_list)  # resolve os.environ/<slot>, drop unset
-    else:
-        if use_db:
-            logger.warning("ROUTER_SOURCE=db but the common-model spine is empty; using YAML.")
-        pool = _load_pool()
-        raw_list = pool.get("model_list", []) or []
-        router_settings = dict(pool.get("router_settings", {}) or {})
-        model_list = _build_model_list(raw_list)
-
-        # Auto-discover every NVIDIA chat model and register it by its full id.
-        model_list.extend(_nvidia_discovered_deployments({d["model_name"] for d in model_list}))
-        # Auto-discover every OpenRouter model and register it by its full id.
-        model_list.extend(_openrouter_discovered_deployments({d["model_name"] for d in model_list}))
-
-        # Hide deployments a manual probe marked unavailable (legacy YAML path).
-        if settings.FILTER_BY_AVAILABILITY:
-            unavailable = get_unavailable_concrete_models()
-            if unavailable:
-                model_list = [
-                    d for d in model_list
-                    if (d.get("litellm_params", {}) or {}).get("model") not in unavailable
-                ]
-
-    if not model_list:
-        logger.warning(
-            "No usable deployments in the pool — set at least one free API key "
-            "(e.g. GROQ_API_KEY_1) in your .env. The /v1 endpoints will error "
-            "until a key is configured."
-        )
-
-    # Drop fallback entries that reference virtual models with no live deployment,
-    # otherwise the Router would try to fall back to an empty model.
-    live_names = {d["model_name"] for d in model_list}
-    raw_fallbacks = router_settings.pop("fallbacks", []) or []
-    fallbacks = []
-    for fb in raw_fallbacks:
-        for primary, targets in fb.items():
-            if primary not in live_names:
-                continue
-            kept = [t for t in targets if t in live_names]
-            if kept:
-                fallbacks.append({primary: kept})
-
-    # Honour the global request timeout from settings.
-    litellm.request_timeout = settings.REQUEST_TIMEOUT
-
-    router = Router(
-        model_list=model_list,
-        fallbacks=fallbacks,
-        timeout=settings.REQUEST_TIMEOUT,
-        **router_settings,
-    )
-
-    # Exclude internal fallback sub-names (`<name>##fbN`) from the public list.
-    _virtual_models = sorted(n for n in live_names if "##fb" not in n)
-    logger.info(
-        "Router built: %d deployment(s) across %d virtual model(s): %s",
-        len(model_list),
-        len(_virtual_models),
-        ", ".join(_virtual_models) or "(none)",
-    )
-    return router
-
-
-def get_router() -> Router:
-    """Return the lazily-built singleton Router."""
-    global _router
-    if _router is None:
-        _router = _build_router()
-    return _router
-
-
-def reload_router() -> Router:
-    """Force a rebuild (e.g. after keys change). Mainly for tests/admin."""
-    global _router
-    _router = None
-    return get_router()
-
-
-# ───────────────────────────────────────────────────────────────
-# INTROSPECTION HELPERS  (used by /v1/models, catalog, health)
-# ───────────────────────────────────────────────────────────────
-
-def list_virtual_models() -> List[str]:
-    """Distinct virtual model names that currently have a live deployment."""
-    get_router()  # ensure built
-    return list(_virtual_models)
-
-
-def get_unavailable_concrete_models() -> set:
-    """
-    Concrete model strings to hide from the pool.
-
-    The legacy model_availability table was removed in the single-model
-    consolidation; per-key availability now lives in the `deployments` table and
-    is applied by the Phase 6 DB-driven builder. Returns an empty set here so the
-    YAML bootstrap path applies no availability filtering.
-    """
-    return set()
-
-
-def all_probe_targets() -> List[Dict[str, Any]]:
-    """
-    Enumerate EVERY deployment (pool + NVIDIA auto-discovered) for the manual
-    availability probe — unfiltered, with resolved keys and the env-var name.
-
-    Each dict: {virtual_model, model, api_key, api_base, api_key_var, provider,
-    mode, extra_params}. `mode` comes from the pool entry's model_info (default
-    "chat") so the probe knows to ping embeddings with an embedding call, and
-    `extra_params` carries required provider params (e.g. NVIDIA's input_type).
-    Deployments whose key env-var is unset are skipped (nothing to test).
-    """
-    pool = _load_pool()
-    raw_list = pool.get("model_list", []) or []
-    targets: List[Dict[str, Any]] = []
-
-    def _add(
-        virtual: str,
-        params: Dict[str, Any],
-        api_key_var: Optional[str],
-        mode: str = "chat",
-    ) -> None:
-        model = params.get("model", "")
-        if not model:
+def record_success(deployment_id: int) -> None:
+    """Mark a deployment used (and healthy) after a successful call."""
+    db = SessionLocal()
+    try:
+        dep = db.query(Deployment).filter(Deployment.id == deployment_id).first()
+        if not dep:
             return
-        targets.append(
-            {
-                "virtual_model": virtual,
-                "model": model,
-                "api_key": params.get("api_key"),
-                "api_base": params.get("api_base"),
-                "api_key_var": api_key_var,
-                "provider": model.split("/", 1)[0] if model else "unknown",
-                "mode": mode,
-                "extra_params": {
-                    k: v for k, v in params.items()
-                    if k not in ("model", "api_key", "api_base", "rpm")
-                },
-            }
-        )
-
-    for entry in raw_list:
-        params = dict(entry.get("litellm_params", {}) or {})
-        virtual = entry.get("model_name", "")
-        mode = (entry.get("model_info") or {}).get("mode") or "chat"
-
-        base = params.get("api_base")
-        if isinstance(base, str) and base.startswith(_ENV_PREFIX):
-            params["api_base"] = os.environ.get(base[len(_ENV_PREFIX):]) or None
-
-        api_key_var: Optional[str] = None
-        ref = params.get("api_key")
-        if isinstance(ref, str) and ref.startswith(_ENV_PREFIX):
-            api_key_var = ref[len(_ENV_PREFIX):]
-            resolved = os.environ.get(api_key_var) or None
-            if not resolved:
-                continue  # key not configured — nothing to probe
-            params["api_key"] = resolved
-
-        _add(virtual, params, api_key_var, mode)
-
-    # NVIDIA + OpenRouter auto-discovered models (each maps to one deployment).
-    existing = {e.get("model_name") for e in raw_list}
-    discovered = _nvidia_discovered_deployments(existing)
-    discovered += _openrouter_discovered_deployments(
-        existing | {d["model_name"] for d in discovered}
-    )
-    for dep in discovered:
-        _add(dep.get("model_name", ""), dict(dep.get("litellm_params", {}) or {}), None)
-
-    return targets
+        now = datetime.now(timezone.utc)
+        dep.last_used_at = now
+        if dep.status is not ModelHealth.available:
+            # It worked — whatever we thought was wrong isn't any more.
+            dep.status = ModelHealth.available
+            dep.cooldown_until = None
+            dep.error = None
+            dep.last_checked_at = now
+        db.commit()
+    except Exception as exc:
+        logger.warning("Could not record success for deployment %s: %s", deployment_id, exc)
+    finally:
+        db.close()
 
 
-def list_key_slots() -> List[Dict[str, Any]]:
-    """
-    Discover the API-key "slots" the pool references, for the Settings UI.
-
-    Reads the raw YAML (not the filtered live pool) so it lists every configurable
-    key — including ones not yet set — and which provider / models each unlocks.
-
-    Returns a list of dicts:
-      { "env_var", "provider", "litellm_models", "virtual_models", "example_model" }
-    """
-    pool = _load_pool()
-    raw_list = pool.get("model_list", []) or []
-
-    slots: Dict[str, Dict[str, Any]] = {}
-    for entry in raw_list:
-        params = entry.get("litellm_params", {}) or {}
-        api_key = params.get("api_key")
-        if not (isinstance(api_key, str) and api_key.startswith(_ENV_PREFIX)):
-            continue  # keyless deployment (e.g. Ollama) — nothing to configure
-        env_var = api_key[len(_ENV_PREFIX):]
-        model = params.get("model", "")
-        provider = model.split("/", 1)[0] if model else "unknown"
-        virtual = entry.get("model_name", "")
-
-        slot = slots.setdefault(
-            env_var,
-            {
-                "env_var": env_var,
-                "provider": provider,
-                "litellm_models": [],
-                "virtual_models": [],
-                "example_model": model,
-            },
-        )
-        if model and model not in slot["litellm_models"]:
-            slot["litellm_models"].append(model)
-        if virtual and virtual not in slot["virtual_models"]:
-            slot["virtual_models"].append(virtual)
-
-    return list(slots.values())
-
-
-def router_health() -> Dict[str, Any]:
-    """
-    Summarise the pool for /health and analytics: how many deployments back each
-    virtual model, and which (if any) are currently cooling down after failures.
-
-    The cooldown API differs across litellm versions, so we read it defensively.
-    """
-    router = get_router()
-
+def router_health(user_id: Optional[int] = None) -> Dict[str, Any]:
+    """Summary for /health. With no user_id, reports cache size only."""
+    if user_id is None:
+        return {"cached_routers": len(_cache)}
+    router = get_router(user_id)
     per_model: Dict[str, int] = {}
     for dep in getattr(router, "model_list", []) or []:
         name = dep.get("model_name", "?")
         per_model[name] = per_model.get(name, 0) + 1
-
-    cooling: List[str] = []
-    try:
-        # Map deployment id -> "virtual/concrete" label for readable output.
-        id_to_label: Dict[str, str] = {}
-        for dep in getattr(router, "model_list", []) or []:
-            dep_id = (dep.get("model_info") or {}).get("id")
-            if dep_id:
-                label = f"{dep.get('model_name')} ({dep.get('litellm_params', {}).get('model')})"
-                id_to_label[dep_id] = label
-
-        cooldown_cache = getattr(router, "cooldown_cache", None)
-        get_active = getattr(cooldown_cache, "get_active_cooldowns", None)
-        if callable(get_active) and id_to_label:
-            active = get_active(list(id_to_label.keys()), None)  # [(id, value), ...]
-            for entry in active or []:
-                dep_id = entry[0] if isinstance(entry, (list, tuple)) else entry
-                cooling.append(id_to_label.get(dep_id, dep_id))
-    except Exception as exc:  # pragma: no cover - version-dependent
-        logger.debug("Could not read cooldown state: %s", exc)
-
     return {
-        "virtual_models": per_model,
+        "models": per_model,
         "total_deployments": sum(per_model.values()),
-        "cooling_down": cooling,
     }

@@ -3,7 +3,10 @@ Gateway API keys — mint / verify / revoke the bearer tokens that unlock /v1.
 
 The raw token is shown ONCE at mint time; only its SHA-256 hash is stored, so a DB
 leak never exposes usable keys. Verification hashes the presented token and looks
-up an active, non-revoked row.
+up a live row.
+
+An ADMIN mints a key FOR a user (`mint(db, user_id=...)`), which is how a user
+gets into the system — there is no signup.
 """
 
 import hashlib
@@ -36,14 +39,19 @@ def generate_token() -> str:
 
 
 def mint(db: Session, user_id: int, name: str = "default") -> Tuple[str, GatewayApiKey]:
-    """Create a key. Returns (raw_token, row). The raw token is not recoverable later."""
+    """
+    Create a key for a specific user. Returns (raw_token, row); the raw token is
+    not recoverable afterwards.
+
+    Note we do NOT set is_active — it is a GENERATED column (revoked_at IS NULL).
+    A fresh row has revoked_at = NULL, so it is live by construction.
+    """
     token = generate_token()
     row = GatewayApiKey(
         user_id=user_id,
         name=name,
         key_hash=_hash(token),
         key_prefix=_display_prefix(token),
-        is_active=True,
     )
     db.add(row)
     db.commit()
@@ -52,12 +60,15 @@ def mint(db: Session, user_id: int, name: str = "default") -> Tuple[str, Gateway
 
 
 def verify(db: Session, token: str) -> Optional[GatewayApiKey]:
-    """Return the active key row matching this token, or None. Touches last_used_at."""
+    """Return the live key row matching this token, or None. Touches last_used_at."""
     if not token:
         return None
     row = (
         db.query(GatewayApiKey)
-        .filter(GatewayApiKey.key_hash == _hash(token), GatewayApiKey.is_active.is_(True))
+        .filter(
+            GatewayApiKey.key_hash == _hash(token),
+            GatewayApiKey.revoked_at.is_(None),   # is_active is generated from this
+        )
         .first()
     )
     if row:
@@ -66,16 +77,28 @@ def verify(db: Session, token: str) -> Optional[GatewayApiKey]:
     return row
 
 
-def revoke(db: Session, key_id: int) -> bool:
-    """Deactivate a key by id. Returns False if not found."""
-    row = db.query(GatewayApiKey).filter(GatewayApiKey.id == key_id).first()
+def revoke(db: Session, key_id: int, user_id: Optional[int] = None) -> bool:
+    """
+    Revoke a key by setting revoked_at (is_active follows automatically — it is a
+    generated column and cannot be assigned).
+
+    Pass user_id to scope the revoke to that user's own keys, so a non-admin can
+    never revoke someone else's key by guessing an id.
+    """
+    q = db.query(GatewayApiKey).filter(GatewayApiKey.id == key_id)
+    if user_id is not None:
+        q = q.filter(GatewayApiKey.user_id == user_id)
+    row = q.first()
     if not row:
         return False
-    row.is_active = False
     row.revoked_at = datetime.now(timezone.utc)
     db.commit()
     return True
 
 
-def list_keys(db: Session) -> List[GatewayApiKey]:
-    return db.query(GatewayApiKey).order_by(GatewayApiKey.id).all()
+def list_keys(db: Session, user_id: Optional[int] = None) -> List[GatewayApiKey]:
+    """All keys, or just one user's. Admin passes None; a user passes their id."""
+    q = db.query(GatewayApiKey)
+    if user_id is not None:
+        q = q.filter(GatewayApiKey.user_id == user_id)
+    return q.order_by(GatewayApiKey.id).all()

@@ -1,8 +1,14 @@
 """
 Shared enum types for the common-model routing spine.
 
-These map to native PostgreSQL ENUM types (`model_health`, `model_mode`) and to
-CHECK-constrained VARCHARs on SQLite, so the same ORM works in prod and in tests.
+These map to the native PostgreSQL ENUM types `model_health` and `model_mode`,
+which are created by schema.sql. Postgres only — SQLite has no enum type, and
+this app does not support it.
+
+The distinctions in ModelHealth carry weight: a 429 means the key WORKS and is
+merely throttled (cool it down, retry soon), while an auth error means the key is
+dead (no cooldown will ever fix it). Collapsing them into one boolean is exactly
+what this enum exists to prevent.
 """
 
 import enum

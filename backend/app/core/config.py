@@ -1,127 +1,77 @@
 """
-Configuration module — single source of truth for all application settings.
+Configuration — process-level settings only.
 
-Uses pydantic-settings to load values from environment variables and .env files.
-Every setting has a sensible default so the app can start with zero configuration
-for local development, but all secrets MUST be overridden in production.
+WHAT DOES *NOT* LIVE HERE ANY MORE, and must not come back:
+
+  • Provider API keys.  They are per-USER, encrypted, in the provider_keys table.
+    An env var is process-global, so a key here would be shared by every user —
+    which is exactly the bug the multi-user rewrite removed. There is no
+    GROQ_API_KEY, no NVIDIA_API_KEY, no OPENAI_API_KEY.
+
+  • The model pool / router source.  There is no YAML pool and no global model
+    list. A user's callable models ARE their deployments; each user's Router is
+    built from them on demand (core/llm_router.py).
+
+  • Router behaviour (retries, cooldowns, strategy). That is PER USER, in the
+    router_config table, editable via GET/PUT /v1/me/router-config.
+
+Everything remaining below is genuinely process-wide: how the server runs, how it
+talks to Postgres, and the key used to encrypt secrets at rest.
 """
 
-import os
 from pathlib import Path
 from typing import Optional, List
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
     """
-    Application settings loaded from environment variables.
-
-    Hierarchy (highest priority first):
-      1. Actual OS environment variables
-      2. Values in the .env file
-      3. Defaults defined below
+    Loaded from (highest priority first): OS environment → .env → defaults below.
     """
 
     # ── App ──────────────────────────────────────────────
-    PROJECT_NAME: str = "Multi-LLM Gateway Platform"
-    VERSION: str = "1.0.0"
-    API_V1_STR: str = "/api/v1"
+    PROJECT_NAME: str = "Multi-LLM Gateway"
+    VERSION: str = "2.0.0"
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     DEBUG: bool = True
-    ENVIRONMENT: str = "development"  # development | staging | production
-    LOG_LEVEL: str = "INFO"           # DEBUG | INFO | WARNING | ERROR
+    ENVIRONMENT: str = "development"   # development | staging | production
+    LOG_LEVEL: str = "INFO"            # DEBUG | INFO | WARNING | ERROR
 
-    # ── Security & Auth ─────────────────────────────────
+    # ── Security ────────────────────────────────────────
     SECRET_KEY: str = Field(default="CHANGE_ME_IN_PRODUCTION_use_openssl_rand_hex_32")
-    ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 hours
 
-    # Fernet key for encrypting provider secrets at rest. If unset, a key is
-    # derived from SECRET_KEY (dev convenience) and a warning is logged — set a
-    # dedicated ENCRYPTION_KEY in production so rotating SECRET_KEY can't brick
-    # stored provider keys. Generate one: `python -c "from cryptography.fernet
-    # import Fernet; print(Fernet.generate_key().decode())"`.
+    # Fernet key encrypting provider secrets at rest. If unset, one is derived from
+    # SECRET_KEY (dev convenience) and a warning is logged — set a dedicated key in
+    # production, so rotating SECRET_KEY cannot brick every stored provider key.
+    # Generate:  python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
     ENCRYPTION_KEY: Optional[str] = None
 
-    # The single gateway owner. A bootstrap user + gateway key are created on
-    # first startup (the key is logged once) so the admin API is reachable.
-    OWNER_EMAIL: str = "owner@localhost"
+    # The first ADMIN. Created on first startup with a gateway key, logged once —
+    # there is no signup flow, so this is the only way into a fresh database.
+    OWNER_EMAIL: str = "admin@localhost"
 
-    # ── CORS ────────────────────────────────────────────
-    # Comma-separated origins for CORS. "*" allows everything (dev only).
-    CORS_ORIGINS: str = "*"
-
-    # ── Rate Limiting ───────────────────────────────────
-    RATE_LIMIT: str = "60/minute"  # slowapi format
-
-    # ── Database ────────────────────────────────────────
-    DATABASE_URL: str = "sqlite:///./gateway.db"
-
-    # ── LLM Request Defaults ────────────────────────────
-    REQUEST_TIMEOUT: int = 120       # seconds per LLM call
-    DEFAULT_MAX_TOKENS: int = 2048
-    DEFAULT_TEMPERATURE: float = 0.7
-    MAX_RETRIES: int = 2             # retries before giving up on a provider
-
-    # ── Smart-Routing Pool (litellm.Router) ─────────────
-    # The YAML pool describes every free-provider deployment (provider + model +
-    # key) behind the gateway. The Router built from it handles rotation, 429
-    # cooldowns, retries and fallbacks across equivalent free backends.
-    MODEL_POOL_PATH: str = "config/model_pool.yaml"
-    # Where the curated model pool (deployments + router settings) is read from:
-    #   auto → use the PostgreSQL tables if they have deployments, else the YAML
-    #   db   → always use PostgreSQL (empty pool if not seeded)
-    #   yaml → always use the YAML file (ignore the DB tables)
-    # Seed the DB from the YAML once with: python -m app.scripts.seed_pool_from_yaml
-    MODEL_POOL_SOURCE: str = "auto"
-    # Where the live Router gets its model list:
-    #   yaml → the YAML bootstrap pool (default, pre-cutover)
-    #   db   → the common-model spine (common_model → members → deployments)
-    # Flip to "db" once the discovery/probe/derive pipeline has been run.
-    ROUTER_SOURCE: str = "yaml"
-    # When an Anthropic/OpenAI client requests a model we don't recognise as a
-    # virtual model (e.g. Claude Code sends "claude-3-5-sonnet"), route it here.
-    DEFAULT_VIRTUAL_MODEL: str = "auto"
-    # When a NVIDIA key is configured, auto-discover EVERY chat model from
-    # NVIDIA's catalog and register it as a callable model (by its full id).
-    NVIDIA_AUTO_DISCOVER: bool = True
-    # Same for OpenRouter: when a key is configured, auto-discover its catalog and
-    # register every model by its full id (e.g. "deepseek/deepseek-r1:free").
-    OPENROUTER_AUTO_DISCOVER: bool = True
-    # Only register OpenRouter models that are free (":free" or zero-priced). Set
-    # False to also expose paid models (they need credits on the account).
-    OPENROUTER_FREE_ONLY: bool = True
-    # When True, the Router hides any deployment a manual availability probe
-    # marked unavailable (see app/scripts/probe_models.py). No effect until a
-    # probe has actually populated the model_availability table.
-    FILTER_BY_AVAILABILITY: bool = True
-
-    # ── Gateway Auth (for /v1 compatibility endpoints) ──
-    # /v1 auth is now DB-issued keys only: clients present a token that must hash
-    # to an active row in `gateway_api_keys` (mint via /v1/admin/gateway-keys).
-    # Secure by default — set REQUIRE_GATEWAY_AUTH=false to open /v1 for local dev.
-    # GATEWAY_API_KEY is retained only for backward-compat env parsing; it is NOT
-    # accepted as a credential anymore.
-    GATEWAY_API_KEY: Optional[str] = None
+    # /v1 auth is DB-issued gateway keys only. Secure by default.
+    # Setting this false opens the CHAT endpoints for local dev — it does NOT open
+    # /v1/admin/* (see api/gateway_auth.py: require_admin never honours the bypass).
     REQUIRE_GATEWAY_AUTH: bool = True
 
-    # ── Provider API Keys ───────────────────────────────
-    # Numbered free keys (GROQ_API_KEY_1, GROQ_API_KEY_2, ...) are read directly
-    # from the environment by the YAML pool via `os.environ/<VAR>` references, so
-    # they do NOT need to be declared here. Legacy single-key fields are kept for
-    # backwards compatibility with the existing UI path.
-    OPENAI_API_KEY: Optional[str] = None
-    ANTHROPIC_API_KEY: Optional[str] = None
-    GEMINI_API_KEY: Optional[str] = None
-    DEEPSEEK_API_KEY: Optional[str] = None
-    XAI_API_KEY: Optional[str] = None
-    NVIDIA_NIM_API_KEY: Optional[str] = None
-    OLLAMA_API_BASE: str = "http://localhost:11434"
+    # ── CORS ────────────────────────────────────────────
+    CORS_ORIGINS: str = "*"            # comma-separated; "*" is dev-only
+
+    # ── Database ────────────────────────────────────────
+    # POSTGRES ONLY. SQLite cannot express the generated columns, triggers, enums
+    # and composite FKs that enforce cross-user key isolation; the app refuses to
+    # start on a sqlite:// URL (see core/database.py).
+    DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/gateway"
+
+    # ── LLM request defaults ────────────────────────────
+    REQUEST_TIMEOUT: int = 120         # seconds per upstream call
+    DEFAULT_MAX_TOKENS: int = 2048     # supplied when an Anthropic client omits it
 
     model_config = SettingsConfigDict(
         env_file=BACKEND_ROOT / ".env",
@@ -129,50 +79,11 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── Helpers ─────────────────────────────────────────
     @property
     def cors_origins_list(self) -> List[str]:
-        """Parse CORS_ORIGINS string into a list."""
         if self.CORS_ORIGINS == "*":
             return ["*"]
-        return [origin.strip() for origin in self.CORS_ORIGINS.split(",")]
-
-    # Maps a free-provider id to the environment-variable prefixes that, when
-    # present, mean the provider has at least one usable key in the pool.
-    _PROVIDER_ENV_PREFIXES = {
-        "groq":       ("GROQ_API_KEY",),
-        "openrouter": ("OPENROUTER_API_KEY",),
-        "gemini":     ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
-        "cerebras":   ("CEREBRAS_API_KEY",),
-        "github":     ("GITHUB_MODELS_TOKEN", "GITHUB_API_KEY"),
-        "mistral":    ("MISTRAL_API_KEY",),
-        "deepseek":   ("DEEPSEEK_API_KEY",),
-        "nvidia_nim": ("NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY"),
-    }
-
-    def get_configured_providers(self) -> List[str]:
-        """
-        Return the free providers that have at least one key configured.
-
-        Detection scans the environment for numbered/plain keys (e.g.
-        GROQ_API_KEY, GROQ_API_KEY_1, GROQ_API_KEY_2), so adding another free
-        account is just another env var — no code change needed.
-        """
-        env_keys = list(os.environ.keys())
-        providers: List[str] = []
-        for provider_id, prefixes in self._PROVIDER_ENV_PREFIXES.items():
-            for prefix in prefixes:
-                if any(
-                    k == prefix or k.startswith(f"{prefix}_")
-                    for k in env_keys
-                    if os.environ.get(k)
-                ):
-                    providers.append(provider_id)
-                    break
-        # Ollama is always "available" (local)
-        providers.append("ollama")
-        return providers
+        return [o.strip() for o in self.CORS_ORIGINS.split(",")]
 
 
-# Singleton instance used across the application
 settings = Settings()

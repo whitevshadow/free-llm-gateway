@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/keygate.tsx","./src/components/ui.tsx","./src/lib/api.ts","./src/lib/types.ts","./src/pages/admin.tsx","./src/pages/dashboard.tsx","./src/pages/logs.tsx","./src/pages/models.tsx","./src/pages/playground.tsx","./src/pages/providers.tsx","./src/pages/settings.tsx"],"version":"5.9.3"}
