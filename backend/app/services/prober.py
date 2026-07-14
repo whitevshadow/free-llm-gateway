@@ -20,8 +20,10 @@ marked 'unavailable', and this promotes them as results land.
 
 import asyncio
 import logging
+import math
 import time
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional, Tuple
 
 import litellm
@@ -43,7 +45,60 @@ logger = logging.getLogger("gateway.prober")
 MAX_CONCURRENCY = 4
 
 PROBE_TIMEOUT = 20            # seconds per probe
-RATE_LIMIT_COOLDOWN = 60      # seconds to bench a deployment that 429s while probing
+
+# ── 429 cooldowns ────────────────────────────────────────────────────────────
+# A flat 60s cooldown burns retries against free tiers that enforce DAILY
+# quotas. Instead: honour Retry-After when the provider sends it; otherwise
+# escalate per deployment on consecutive 429s (strike 1 → 60s, 2 → 2m, 3+ → 5m).
+# Strikes reset to 0 on any success, so one throttled minute doesn't haunt a key.
+COOLDOWN_LADDER = (60, 120, 300)   # seconds, indexed by consecutive 429s
+RETRY_AFTER_CAP = 900              # never trust a header past 15 minutes
+
+
+def retry_after_seconds(exc: Exception) -> Optional[int]:
+    """
+    The provider's own Retry-After, in seconds, if the exception carries one.
+
+    litellm exceptions wrap the underlying httpx response; we look there first,
+    then on the exception itself. Handles both delta-seconds and HTTP-date
+    forms. Returns None when absent or unparseable — never raises.
+    """
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        headers = getattr(exc, "headers", None)
+    if not headers:
+        return None
+    try:
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+    except Exception:
+        return None
+    if not raw:
+        return None
+
+    raw = str(raw).strip()
+    try:
+        secs = float(raw)
+    except ValueError:
+        try:
+            secs = (parsedate_to_datetime(raw)
+                    - datetime.now(timezone.utc)).total_seconds()
+        except Exception:
+            return None
+    if secs <= 0:
+        return None
+    return min(math.ceil(secs), RETRY_AFTER_CAP)
+
+
+def cooldown_seconds(strikes: int, retry_after: Optional[int] = None) -> int:
+    """
+    How long to bench a deployment after its `strikes`-th consecutive 429.
+
+    The provider's Retry-After always wins — it knows its own limits. Otherwise
+    walk the ladder and stay on the last rung.
+    """
+    if retry_after is not None:
+        return retry_after
+    return COOLDOWN_LADDER[min(max(strikes, 1), len(COOLDOWN_LADDER)) - 1]
 
 
 # ── Probe progress, per user ─────────────────────────────────────────────────
@@ -144,10 +199,11 @@ async def _probe_one(
             )
         latency = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
         return {"status": ModelHealth.available, "http_code": 200,
-                "latency_ms": latency, "error": None}
+                "latency_ms": latency, "error": None, "retry_after": None}
     except Exception as exc:
         status, code, msg = _classify(exc)
-        return {"status": status, "http_code": code, "latency_ms": None, "error": msg[:500]}
+        return {"status": status, "http_code": code, "latency_ms": None,
+                "error": msg[:500], "retry_after": retry_after_seconds(exc)}
 
 
 async def probe_deployments(deployment_ids: List[int]) -> Dict:
@@ -217,11 +273,17 @@ async def probe_deployments(deployment_ids: List[int]) -> Dict:
 
             # A 429 gets a cooldown, so is_callable() revives it automatically once
             # it expires. Anything else CLEARS the cooldown: a dead key must never
-            # be resurrected by a stale timer.
+            # be resurrected by a stale timer. Strikes reset only on SUCCESS —
+            # a timeout between two 429s says nothing about the quota.
             if res["status"] is ModelHealth.rate_limited:
-                dep.cooldown_until = now + timedelta(seconds=RATE_LIMIT_COOLDOWN)
+                dep.rate_limit_strikes = (dep.rate_limit_strikes or 0) + 1
+                dep.cooldown_until = now + timedelta(
+                    seconds=cooldown_seconds(dep.rate_limit_strikes, res["retry_after"])
+                )
             else:
                 dep.cooldown_until = None
+                if res["status"] is ModelHealth.available:
+                    dep.rate_limit_strikes = 0
 
             # is_working is GENERATED from status — never assign it.
             counts[res["status"].value] = counts.get(res["status"].value, 0) + 1

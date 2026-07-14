@@ -26,6 +26,19 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
+# The single source of env config lives at the REPO ROOT (.env), shared by both
+# docker compose and local `uvicorn` runs — there is no separate backend/.env.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+# Hardcoded fallback master admin key — baked in so the gateway has a working
+# admin credential with ZERO setup (no .env, no scraping logs). The env var
+# MASTER_ADMIN_KEY overrides it.
+#
+# ⚠ THIS VALUE IS IN SOURCE CONTROL. Anyone with the repo can use it as admin.
+#   It is a DEV DEFAULT ONLY. For anything real, set MASTER_ADMIN_KEY in .env to
+#   a long random value — the app logs a loud warning at startup while this
+#   unchanged default is in effect (see main.py).
+DEFAULT_MASTER_ADMIN_KEY = "sk-gw-master-dev-CHANGE-ME-a1b2c3d4e5f6"
 
 
 class Settings(BaseSettings):
@@ -60,6 +73,21 @@ class Settings(BaseSettings):
     # /v1/admin/* (see api/gateway_auth.py: require_admin never honours the bypass).
     REQUIRE_GATEWAY_AUTH: bool = True
 
+    # STABLE MASTER ADMIN KEY — a fixed gateway key, defined here rather than minted
+    # into the DB. Presenting it authenticates as the owner admin (OWNER_EMAIL),
+    # short-circuiting the DB lookup entirely: it never changes, survives a database
+    # reset, and never needs scraping from the startup logs. Unset (the default)
+    # means no master key exists and only DB-issued keys work.
+    #
+    # It IS a root credential — treat it exactly like the bootstrap key. Set a long
+    # random value (e.g. `sk-gw-master-$(openssl rand -hex 24)`), keep it out of
+    # source control, and rotate it by changing this one variable. When set, the
+    # bootstrap step skips minting a throwaway admin key (this one is enough).
+    #
+    # Defaults to the hardcoded DEFAULT_MASTER_ADMIN_KEY above so admin access
+    # works out of the box; override it in .env for any real deployment.
+    MASTER_ADMIN_KEY: Optional[str] = DEFAULT_MASTER_ADMIN_KEY
+
     # ── CORS ────────────────────────────────────────────
     CORS_ORIGINS: str = "*"            # comma-separated; "*" is dev-only
 
@@ -73,8 +101,16 @@ class Settings(BaseSettings):
     REQUEST_TIMEOUT: int = 120         # seconds per upstream call
     DEFAULT_MAX_TOKENS: int = 2048     # supplied when an Anthropic client omits it
 
+    # ── Background scheduler (services/scheduler.py) ────
+    # Two loops: a daily catalog refresh, and a periodic re-probe of UNHEALTHY
+    # deployments only — healthy ones are kept fresh by real traffic for free
+    # (record_success/record_failure), so scheduled probes never touch them.
+    SCHEDULER_ENABLED: bool = True
+    DISCOVERY_INTERVAL_HOURS: int = 24     # catalog refresh cadence
+    REPROBE_INTERVAL_MINUTES: int = 20     # unhealthy-deployment re-probe cadence
+
     model_config = SettingsConfigDict(
-        env_file=BACKEND_ROOT / ".env",
+        env_file=REPO_ROOT / ".env",   # the ONE .env, at the repo root
         env_file_encoding="utf-8",
         extra="ignore",
     )

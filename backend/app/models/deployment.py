@@ -74,6 +74,9 @@ class Deployment(Base):
     error = Column(Text, nullable=True)
     rpm = Column(Integer, nullable=True)                       # per-key requests/min hint
     cooldown_until = Column(DateTime(timezone=True), nullable=True)  # benched after a 429
+    # Consecutive 429s — drives the escalating cooldown ladder (60s → 2m → 5m).
+    # Reset to 0 by any success. See services/prober.py: cooldown_seconds().
+    rate_limit_strikes = Column(Integer, nullable=False, default=0)
 
     last_checked_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     last_used_at = Column(DateTime(timezone=True), nullable=True)

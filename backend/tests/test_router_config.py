@@ -84,3 +84,38 @@ def test_reset_restores_defaults(app_client, user_key):
 
 def test_router_config_requires_auth(app_client):
     assert app_client.get("/v1/me/router-config").status_code == 401
+
+
+def test_pin_round_trip_and_clear(app_client, user_key, db):
+    """Pin a real provider, see it in the payload, clear it with 0."""
+    from app.models.provider import Provider
+
+    prov = Provider(slug="pin-test", name="Pin Test", enabled=True)
+    db.add(prov)
+    db.commit()
+    db.refresh(prov)
+
+    h = {"Authorization": f"Bearer {user_key}"}
+    r = app_client.put("/v1/me/router-config", headers=h,
+                       json={"pinned_provider_id": prov.id})
+    assert r.status_code == 200
+    assert r.json()["pinned_provider_id"] == prov.id
+
+    # Omitting the field on a later partial update must keep the pin…
+    r = app_client.put("/v1/me/router-config", headers=h, json={"num_retries": 3})
+    assert r.json()["pinned_provider_id"] == prov.id
+
+    # …and 0 clears it (None can't — partial updates drop None fields).
+    r = app_client.put("/v1/me/router-config", headers=h,
+                       json={"pinned_provider_id": 0})
+    assert r.json()["pinned_provider_id"] is None
+
+
+def test_pin_to_unknown_provider_is_rejected(app_client, user_key):
+    r = app_client.put(
+        "/v1/me/router-config",
+        headers={"Authorization": f"Bearer {user_key}"},
+        json={"pinned_provider_id": 987654},
+    )
+    assert r.status_code == 400
+    assert "pinned_provider_id" in r.json()["detail"]

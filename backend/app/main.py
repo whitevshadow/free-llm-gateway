@@ -36,6 +36,7 @@ from app.api.router import api_router
 from app.api import openai_compat, anthropic_compat, admin, me
 from app.middleware.request_id import RequestIDMiddleware
 from app.middleware.logging_middleware import LoggingMiddleware
+from app.middleware.compression import ConditionalGZipMiddleware
 from app.exceptions import GatewayException
 from app.utils.responses import success_response, error_response
 from app.core.frontend import mount_frontend
@@ -93,6 +94,16 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error(f"Database initialisation failed: {exc}")
 
+    # Shout if the hardcoded default master key is still in effect. It IS in
+    # source control, so leaving it unchanged means anyone with the repo is admin.
+    from app.core.config import DEFAULT_MASTER_ADMIN_KEY
+    if settings.MASTER_ADMIN_KEY == DEFAULT_MASTER_ADMIN_KEY:
+        bar = "!" * 66
+        logger.warning(bar)
+        logger.warning("MASTER_ADMIN_KEY is the HARDCODED DEV DEFAULT — it is public in")
+        logger.warning("source control. Set MASTER_ADMIN_KEY in .env before any real use.")
+        logger.warning(bar)
+
     # Ensure the owner user + a gateway key exist so the admin API is reachable
     # on a fresh DB (the bootstrap key is logged once).
     try:
@@ -109,12 +120,21 @@ async def lifespan(app: FastAPI):
     # Routers are built PER USER, lazily, on first request (core/llm_router.py),
     # so there is nothing to preload here.
     logger.info("Routers are built per-user on demand; no global pool to preload.")
+
+    # Background loops: daily catalog discovery + periodic re-probe of unhealthy
+    # deployments (SRS §10). Neither ever runs inside a user request.
+    from app.services import scheduler
+    try:
+        scheduler.start()
+    except Exception as exc:
+        logger.error(f"Scheduler failed to start: {exc}")
     logger.info("=" * 60)
 
     yield  # ← App is running and serving requests here
 
     # ── Shutdown ────────────────────────────────────────
     logger.info("Shutting down Multi-LLM Gateway...")
+    await scheduler.stop()
 
 
 # ───────────────────────────────────────────────────────────────
@@ -158,6 +178,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# nginx used to gzip the ~660 KB JS bundle (→ ~190 KB). Now that uvicorn serves
+# the SPA, this takes over — but ONLY for non-/v1 paths, so SSE chat streams are
+# never buffered by the compressor. See middleware/compression.py.
+app.add_middleware(ConditionalGZipMiddleware, minimum_size=1024)
 
 
 # ───────────────────────────────────────────────────────────────

@@ -63,17 +63,39 @@ TTL_SECONDS = 30
 _cache: Dict[int, Tuple[Router, float, List[str]]] = {}
 
 
-def _router_settings(db: Session, user_id: int) -> Dict[str, Any]:
+def _router_settings(
+    db: Session, user_id: int,
+) -> Tuple[Dict[str, Any], Optional[int]]:
+    """The user's Router kwargs, plus their pinned provider id (None = no pin)."""
     rc = db.query(RouterConfig).filter(RouterConfig.user_id == user_id).first()
     if not rc:
         return {"routing_strategy": "usage-based-routing-v2", "num_retries": 4,
-                "cooldown_time": 30, "allowed_fails": 3}
+                "cooldown_time": 30, "allowed_fails": 3}, None
     return {
         "routing_strategy": rc.routing_strategy,
         "num_retries": rc.num_retries,
         "cooldown_time": rc.cooldown_time,
         "allowed_fails": rc.allowed_fails,
+    }, rc.pinned_provider_id
+
+
+def _apply_pin(rows: List[Any], pinned_provider_id: Optional[int]) -> List[Any]:
+    """
+    Soft pin: PER MODEL, if the pinned provider has a callable deployment, offer
+    only its deployments; models the pinned provider does not serve keep their
+    full candidate set. Pinning narrows candidates — it never empties them, and
+    it never overrides health or cooldowns (an unhealthy pinned deployment is
+    already absent from `rows`, so its model falls back to the other providers).
+    """
+    if not pinned_provider_id:
+        return rows
+    pinned_models = {
+        r["model"] for r in rows if r["provider_id"] == pinned_provider_id
     }
+    return [
+        r for r in rows
+        if r["provider_id"] == pinned_provider_id or r["model"] not in pinned_models
+    ]
 
 
 def _build(db: Session, user_id: int) -> Tuple[Router, List[str]]:
@@ -87,6 +109,9 @@ def _build(db: Session, user_id: int) -> Tuple[Router, List[str]]:
     rows = db.execute(
         select(v_live_deployments).where(v_live_deployments.c.user_id == user_id)
     ).mappings().all()
+
+    router_kwargs, pinned_provider_id = _router_settings(db, user_id)
+    rows = _apply_pin(rows, pinned_provider_id)
 
     # Decrypt each key once, not once per deployment.
     key_ids = {r["provider_key_id"] for r in rows}
@@ -124,7 +149,7 @@ def _build(db: Session, user_id: int) -> Tuple[Router, List[str]]:
     router = Router(
         model_list=model_list,
         timeout=settings.REQUEST_TIMEOUT,
-        **_router_settings(db, user_id),
+        **router_kwargs,
     )
     names = sorted({d["model_name"] for d in model_list})
     logger.info(
@@ -181,7 +206,7 @@ def record_failure(deployment_id: int, exc: Exception) -> None:
     dashboard, and lost on restart. The DB is the durable truth; this is what
     keeps it that way.
     """
-    from app.services.prober import _classify, RATE_LIMIT_COOLDOWN
+    from app.services.prober import _classify, cooldown_seconds, retry_after_seconds
 
     status, code, msg = _classify(exc)
     now = datetime.now(timezone.utc)
@@ -195,10 +220,15 @@ def record_failure(deployment_id: int, exc: Exception) -> None:
         dep.http_code = code
         dep.error = msg[:500]
         dep.last_checked_at = now
-        dep.cooldown_until = (
-            now + timedelta(seconds=RATE_LIMIT_COOLDOWN)
-            if status is ModelHealth.rate_limited else None
-        )
+        # 429s escalate: honour the provider's Retry-After when present, else
+        # walk the per-deployment ladder (60s → 2m → 5m) on consecutive strikes.
+        if status is ModelHealth.rate_limited:
+            dep.rate_limit_strikes = (dep.rate_limit_strikes or 0) + 1
+            dep.cooldown_until = now + timedelta(
+                seconds=cooldown_seconds(dep.rate_limit_strikes, retry_after_seconds(exc))
+            )
+        else:
+            dep.cooldown_until = None
         db.commit()
         invalidate(dep.user_id)
         logger.info("Deployment %s marked %s from a live request.", deployment_id, status.value)
@@ -217,6 +247,8 @@ def record_success(deployment_id: int) -> None:
             return
         now = datetime.now(timezone.utc)
         dep.last_used_at = now
+        # A success ends any 429 streak — the next throttle starts the ladder over.
+        dep.rate_limit_strikes = 0
         if dep.status is not ModelHealth.available:
             # It worked — whatever we thought was wrong isn't any more.
             dep.status = ModelHealth.available

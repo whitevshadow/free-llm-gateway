@@ -38,6 +38,10 @@ dist-ssr/
 # Secrets & local runtime state (NEVER commit)
 .env
 
+# Exported provider-key backups — plaintext or masked, never commit
+provider-keys.csv
+provider-keys-secret.csv
+
 # Claude Code tooling / skills (not part of the app)
 .claude/
 .agents/

@@ -23,6 +23,7 @@ curling. It DOES NOT open /v1/admin/* — a misconfigured env var must never exp
 key management. See _dev_bypass_user().
 """
 
+import secrets
 from typing import Optional
 
 from fastapi import Depends, Header, HTTPException, status
@@ -33,6 +34,32 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models.user import User
 from app.services import gateway_keys
+
+
+def _master_admin(token: str, db: Session) -> Optional[User]:
+    """
+    Resolve the STABLE master admin key (settings.MASTER_ADMIN_KEY) to the owner
+    admin, or None if it isn't configured or doesn't match.
+
+    Checked BEFORE the DB so the master key works even on a freshly reset
+    database. The comparison is constant-time (secrets.compare_digest) so a wrong
+    key can't be recovered a byte at a time by timing the response. A blank
+    configured key never matches — otherwise an unset master key would let an
+    empty token authenticate as admin.
+    """
+    master = settings.MASTER_ADMIN_KEY
+    if not master or not token:
+        return None
+    if not secrets.compare_digest(token, master):
+        return None
+    # Prefer the named owner; fall back to any admin so a renamed OWNER_EMAIL
+    # doesn't lock the master key out.
+    return (
+        db.query(User)
+        .filter(User.is_admin.is_(True))
+        .order_by((User.email != settings.OWNER_EMAIL), User.id)
+        .first()
+    )
 
 # Declared purely so Swagger renders an "Authorize" button and sends the key on
 # Try-it-out. auto_error=False: we read the header ourselves (two header names).
@@ -77,6 +104,14 @@ def _resolve(token: Optional[str], db: Session, *, allow_bypass: bool) -> User:
             if user:
                 return user
         raise _unauthorized("Missing API key.")
+
+    # The stable master admin key resolves to the owner admin, ahead of the DB —
+    # so it keeps working across DB resets and is honoured on admin routes too
+    # (require_admin passes allow_bypass=False, but this is a real credential, not
+    # the dev bypass, so it is checked here regardless).
+    master_user = _master_admin(token, db)
+    if master_user:
+        return master_user
 
     key = gateway_keys.verify(db, token)
     if not key:

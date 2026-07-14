@@ -96,6 +96,32 @@ def revoke(db: Session, key_id: int, user_id: Optional[int] = None) -> bool:
     return True
 
 
+def revoke_user_keys(
+    db: Session, user_id: int, except_id: Optional[int] = None,
+) -> int:
+    """
+    Revoke every LIVE gateway key a user holds, optionally sparing one.
+
+    This is the revoke half of a rotation: mint the new key first, then call this
+    with except_id=<new row id> so the freshly issued key survives while all the
+    old ones die in a single commit. Returns how many were revoked.
+    """
+    q = db.query(GatewayApiKey).filter(
+        GatewayApiKey.user_id == user_id,
+        GatewayApiKey.revoked_at.is_(None),   # is_active is generated from this
+    )
+    if except_id is not None:
+        q = q.filter(GatewayApiKey.id != except_id)
+
+    now = datetime.now(timezone.utc)
+    revoked = 0
+    for row in q.all():
+        row.revoked_at = now
+        revoked += 1
+    db.commit()
+    return revoked
+
+
 def list_keys(db: Session, user_id: Optional[int] = None) -> List[GatewayApiKey]:
     """All keys, or just one user's. Admin passes None; a user passes their id."""
     q = db.query(GatewayApiKey)

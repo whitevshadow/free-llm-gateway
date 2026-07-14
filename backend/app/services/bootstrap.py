@@ -32,6 +32,16 @@ def ensure_admin_and_bootstrap_key() -> None:
             db.refresh(admin)
             logger.info("Created admin user %s.", settings.OWNER_EMAIL)
 
+        # A configured master key IS the admin credential — stable and DB-independent.
+        # Don't also mint a throwaway bootstrap key nobody would use; just point the
+        # operator at the one they set.
+        if settings.MASTER_ADMIN_KEY:
+            logger.info(
+                "MASTER_ADMIN_KEY is set — using it as the admin credential for %s. "
+                "No bootstrap key minted.", settings.OWNER_EMAIL,
+            )
+            return
+
         live = (
             db.query(GatewayApiKey)
             .filter(
@@ -49,6 +59,7 @@ def ensure_admin_and_bootstrap_key() -> None:
             logger.warning("Send as:  Authorization: Bearer <key>   or   x-api-key: <key>")
             logger.warning("Seed providers:  POST /v1/admin/providers")
             logger.warning("Mint user keys:  POST /v1/admin/gateway-keys")
+            logger.warning("Tip: set MASTER_ADMIN_KEY in .env for a stable admin key.")
             logger.warning(bar)
     finally:
         db.close()

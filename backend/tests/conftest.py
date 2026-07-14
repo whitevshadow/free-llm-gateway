@@ -28,6 +28,10 @@ PG_URL = f"postgresql+psycopg2://postgres:postgres@localhost:{PG_PORT}/gateway_t
 os.environ["DATABASE_URL"] = PG_URL
 os.environ["REQUIRE_GATEWAY_AUTH"] = "true"   # pin auth ON so RBAC tests are real
 os.environ["DEBUG"] = "false"
+os.environ["SCHEDULER_ENABLED"] = "false"     # no background probes during tests
+# Disable the hardcoded default master key: tests that want one opt in by
+# monkeypatching settings.MASTER_ADMIN_KEY, so RBAC assertions stay deterministic.
+os.environ["MASTER_ADMIN_KEY"] = ""
 
 
 def _docker(*args: str) -> subprocess.CompletedProcess:

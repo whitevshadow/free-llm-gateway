@@ -48,7 +48,8 @@ def test_admin_can_reach_admin_routes(app_client, admin_key):
         "/v1/admin/providers", headers=h,
         json={"slug": "groq", "name": "Groq"},
     )
-    assert r.status_code in (200, 409)   # 409 if a previous test already made it
+    # 201 on create, 409 if a previous test already made it
+    assert r.status_code in (201, 409)
 
 
 def test_user_cannot_see_another_users_provider_keys(app_client, admin_key, user_key):

@@ -316,6 +316,50 @@ async def mint_gateway_key(
     }
 
 
+class RotateKeyRequest(BaseModel):
+    """Nothing required — sensible defaults rotate the caller's own admin key."""
+
+    name: str = Field(default="admin", description="Label for the new key")
+    revoke_existing: bool = Field(
+        default=True,
+        description="Revoke the caller's other gateway keys (true = a real rotation)",
+    )
+
+
+@router.post("/v1/admin/gateway-keys/rotate")
+async def rotate_my_admin_key(
+    payload: RotateKeyRequest = RotateKeyRequest(),
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Issue a fresh gateway key for the CALLING admin, and (by default) revoke their
+    old ones — a self-service rotation. The raw token is returned ONCE.
+
+    Mint-then-revoke order matters: the new key is created first and spared from
+    the revoke, so there is never a window where the admin has no working key.
+
+    This touches only DB-issued keys. A configured MASTER_ADMIN_KEY lives in
+    config, not the database, so it is NEVER revoked here — it remains the
+    unloseable way back in even if a rotation goes wrong. (If you authenticated
+    WITH the master key, this simply mints a DB key for the owner admin.)
+    """
+    token, row = gateway_keys.mint(db, admin.id, name=payload.name)
+    revoked = (
+        gateway_keys.revoke_user_keys(db, admin.id, except_id=row.id)
+        if payload.revoke_existing else 0
+    )
+    return {
+        "id": row.id,
+        "user_id": row.user_id,
+        "name": row.name,
+        "token": token,                # shown once
+        "key_prefix": row.key_prefix,
+        "revoked_previous": revoked,
+        "warning": "Store this token now — it cannot be retrieved again.",
+    }
+
+
 @router.get("/v1/admin/gateway-keys")
 async def list_all_gateway_keys(
     _: User = Depends(require_admin), db: Session = Depends(get_db),
@@ -612,6 +656,7 @@ _DEFAULTS = {
     "num_retries": 4,
     "cooldown_time": 30,
     "allowed_fails": 3,
+    "pinned_provider_id": None,
 }
 
 
@@ -630,6 +675,12 @@ class RouterConfigRequest(BaseModel):
     allowed_fails: Optional[int] = Field(
         None, ge=1, le=100, description="Failures before a deployment is benched"
     )
+    # Partial updates use exclude_none, so None cannot mean "clear the pin";
+    # send 0 to unpin. (A provider id can never be 0 — BIGINT IDENTITY starts at 1.)
+    pinned_provider_id: Optional[int] = Field(
+        None, ge=0,
+        description="Prefer this provider where it serves a model. 0 clears the pin.",
+    )
 
 
 def _config_payload(rc: Optional[RouterConfig]) -> dict:
@@ -640,6 +691,7 @@ def _config_payload(rc: Optional[RouterConfig]) -> dict:
         "num_retries": rc.num_retries,
         "cooldown_time": rc.cooldown_time,
         "allowed_fails": rc.allowed_fails,
+        "pinned_provider_id": rc.pinned_provider_id,
         "is_default": False,
     }
 
@@ -676,12 +728,28 @@ async def update_my_router_config(
             detail=f"Unknown routing_strategy. Valid: {sorted(_STRATEGIES)}",
         )
 
+    # Validate the pin HERE, not inside Router construction on the next chat
+    # request. 0 means "clear the pin" (None can't — partial update semantics).
+    if payload.pinned_provider_id:
+        pinned = (
+            db.query(Provider)
+            .filter(Provider.id == payload.pinned_provider_id, Provider.enabled.is_(True))
+            .first()
+        )
+        if not pinned:
+            raise HTTPException(
+                status_code=400,
+                detail="pinned_provider_id does not match an enabled provider.",
+            )
+
     rc = db.query(RouterConfig).filter(RouterConfig.user_id == user.id).first()
     if not rc:
         rc = RouterConfig(user_id=user.id, **_DEFAULTS)
         db.add(rc)
 
     for field, value in payload.model_dump(exclude_none=True).items():
+        if field == "pinned_provider_id" and value == 0:
+            value = None
         setattr(rc, field, value)
 
     db.commit()

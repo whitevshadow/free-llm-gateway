@@ -56,24 +56,52 @@ def get_db():
         db.close()
 
 
+# ── Micro-migrations ─────────────────────────────────────────────────────────
+# schema.sql is applied ONLY to an empty database, so a column added there never
+# reaches a database that already has data. Each statement below is idempotent
+# (ADD COLUMN IF NOT EXISTS) and mirrors something ALREADY present in schema.sql
+# — fresh databases get it from the schema, existing ones from here. Additive,
+# in-place changes only; anything structural (new tables, triggers, backfills)
+# means it is time for Alembic.
+MIGRATIONS = [
+    # Escalating 429 cooldowns (SRS §7.3): consecutive-429 counter per deployment.
+    "ALTER TABLE deployments "
+    "ADD COLUMN IF NOT EXISTS rate_limit_strikes INTEGER NOT NULL DEFAULT 0",
+    # Provider pinning (SRS §8.3): per-user soft pin, filters the candidate set.
+    "ALTER TABLE router_config "
+    "ADD COLUMN IF NOT EXISTS pinned_provider_id BIGINT "
+    "REFERENCES providers(id) ON DELETE SET NULL",
+]
+
+
+def run_migrations() -> None:
+    """Apply the idempotent micro-migrations. Safe to run on every startup."""
+    with engine.begin() as conn:
+        for stmt in MIGRATIONS:
+            conn.execute(text(stmt))
+
+
 def init_schema() -> bool:
     """
-    Apply schema.sql if the database is empty.
+    Apply schema.sql if the database is empty, then the micro-migrations.
 
     Returns True if the schema was applied, False if it was already present.
     Idempotent by inspection: we look for the `users` table rather than relying
     on IF NOT EXISTS, because schema.sql also creates types, functions, triggers
     and views, and re-running it wholesale on a live database would error.
 
-    This is a bootstrap for fresh deployments, NOT a migration tool. Once the
-    schema changes against a database with real data, move to Alembic.
+    This is a bootstrap for fresh deployments, NOT a migration tool — the
+    micro-migrations above cover additive column changes only.
     """
     with engine.connect() as conn:
         exists = conn.execute(text("SELECT to_regclass('public.users')")).scalar()
-        if exists:
-            return False
 
-    sql = SCHEMA_PATH.read_text(encoding="utf-8")
-    with engine.begin() as conn:
-        conn.execute(text(sql))
-    return True
+    applied = False
+    if not exists:
+        sql = SCHEMA_PATH.read_text(encoding="utf-8")
+        with engine.begin() as conn:
+            conn.execute(text(sql))
+        applied = True
+
+    run_migrations()
+    return applied

@@ -5,10 +5,11 @@ ADMIN-DRIVEN. An admin seeds a provider, then runs discovery, which asks the
 provider what it actually serves and upserts the result. New models appear on
 their own; nobody hand-maintains a YAML list.
 
-Discovery needs a key to call /v1/models, so it BORROWS any active key for that
-provider (one read-only call). That is a deliberate, narrow exception to per-user
-key isolation — the only place a user's key is used on behalf of the system rather
-than on behalf of that user.
+Discovery needs a key to call /v1/models, so it BORROWS one active key for that
+provider (one read-only call), ROTATING DAILY across the provider's keys so no
+single key holder pays for every catalog refresh. That is a deliberate, narrow
+exception to per-user key isolation — the only place a user's key is used on
+behalf of the system rather than on behalf of that user.
 
 WHAT IT MUST NOT DO: set is_common or provider_count. Those are maintained by a
 Postgres trigger; writing them here would create a second, drifting source of
@@ -16,6 +17,7 @@ truth. Insert the rows and the flags follow.
 """
 
 import logging
+from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
 
 import httpx
@@ -46,15 +48,38 @@ def _infer_mode(model_id: str) -> ModelMode:
     return ModelMode.chat
 
 
+def _rotation_index(count: int, when: Optional[date] = None) -> int:
+    """
+    Which of `count` keys today's discovery borrows.
+
+    Deterministic by DATE, not stored state: the same key serves every discovery
+    for one calendar day (a manual refresh does not burn a second key), and the
+    next day rotates to the next one. Stateless, so it survives restarts and
+    needs no schema — and over a month, no single key pays for more than its
+    share of catalog calls.
+    """
+    when = when or datetime.now(timezone.utc).date()
+    return when.toordinal() % count
+
+
 def _borrow_key(db: Session, provider_id: int) -> Optional[str]:
-    """Any active key for this provider, decrypted. Used ONLY to call /v1/models."""
-    row = (
+    """
+    One active key for this provider, decrypted. Used ONLY to call /v1/models.
+
+    Rotates daily across the provider's active keys (see _rotation_index) so the
+    borrow cost is spread over every key holder instead of always billing the
+    oldest key.
+    """
+    rows = (
         db.query(ProviderKey)
         .filter(ProviderKey.provider_id == provider_id, ProviderKey.is_active.is_(True))
         .order_by(ProviderKey.id)
-        .first()
+        .all()
     )
-    return crypto.decrypt(row.key_ciphertext) if row else None
+    if not rows:
+        return None
+    row = rows[_rotation_index(len(rows))]
+    return crypto.decrypt(row.key_ciphertext)
 
 
 def _base_url(provider: Provider) -> Optional[str]:

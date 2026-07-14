@@ -344,6 +344,10 @@ CREATE TABLE deployments (
     error             TEXT,
     rpm               INTEGER,                 -- per-key requests/min hint
     cooldown_until    TIMESTAMPTZ,             -- benched until this time after a 429
+    -- Consecutive 429s. Drives the escalating cooldown ladder (60s → 2m → 5m):
+    -- a free tier enforcing a DAILY quota should not be retried every 60s all day.
+    -- Reset to 0 by any successful call or probe.
+    rate_limit_strikes INTEGER    NOT NULL DEFAULT 0,
     last_checked_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
     last_used_at      TIMESTAMPTZ,
     created_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
@@ -454,6 +458,11 @@ CREATE TABLE router_config (
     num_retries      INTEGER     NOT NULL DEFAULT 4,
     cooldown_time    INTEGER     NOT NULL DEFAULT 30,   -- seconds benched after a 429
     allowed_fails    INTEGER     NOT NULL DEFAULT 3,
+    -- Preferred provider (soft pin). Pinning FILTERS the candidate set per model:
+    -- where the pinned provider serves a model, only its deployments are offered;
+    -- models it does not serve keep their full candidate set. It never overrides
+    -- health or cooldowns, and it is not a score.
+    pinned_provider_id BIGINT    REFERENCES providers(id) ON DELETE SET NULL,
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TRIGGER trg_router_touch BEFORE UPDATE ON router_config

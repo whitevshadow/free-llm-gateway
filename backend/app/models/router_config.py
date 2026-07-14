@@ -29,6 +29,12 @@ class RouterConfig(Base):
     num_retries = Column(Integer, nullable=False, default=4)
     cooldown_time = Column(Integer, nullable=False, default=30)   # seconds benched after 429
     allowed_fails = Column(Integer, nullable=False, default=3)
+    # Soft pin: where this provider serves a model, offer only its deployments;
+    # models it does not serve keep their full candidate set. Filters candidates,
+    # never overrides health/cooldowns. NULL = no pin.
+    pinned_provider_id = Column(
+        BigInteger, ForeignKey("providers.id", ondelete="SET NULL"), nullable=True,
+    )
 
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 

@@ -1,19 +1,29 @@
 # syntax=docker/dockerfile:1
 # ─────────────────────────────────────────────────────────────────────────────
-#  Backend — FastAPI + LiteLLM. API ONLY.
+#  Multi-LLM Gateway — ONE image, ONE port. FastAPI + LiteLLM serve the API AND
+#  the compiled React SPA from the same uvicorn process (mount_frontend()).
 #
-#  The SPA is NOT in this image. It is built and served by the `web` (nginx)
-#  container — see frontend/Dockerfile. Keeping a copy here too would mean two
-#  builds of the same app that can silently drift apart.
+#  The SPA is built in stage 1 and copied into /app/static, where
+#  mount_frontend() finds index.html and serves it alongside /v1, /docs, /health
+#  — no nginx, no second container, no CORS (everything is one origin). Streaming
+#  chat completions work natively because uvicorn does not buffer responses the
+#  way a reverse proxy would.
 #
-#  With no /app/static present, mount_frontend() detects API-only mode and skips
-#  its SPA catch-all route, so `/` returns a JSON welcome instead of an index.html
-#  that isn't there.
-#
-#  Build context is the REPO ROOT (it needs backend/schema.sql).
+#  Build context is the REPO ROOT (it needs backend/ and frontend/).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Stage 1: python dependencies ─────────────────────────────────────────────
+# ── Stage 1: compile the SPA ─────────────────────────────────────────────────
+#  vite.config.ts writes to ../backend/static, so from /build/frontend the
+#  output lands at /build/backend/static; the runtime stage copies it from there.
+FROM node:20-alpine AS frontend
+WORKDIR /build/frontend
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install --no-audit --no-fund
+COPY frontend/ ./
+RUN npm run build
+
+
+# ── Stage 2: python dependencies ─────────────────────────────────────────────
 FROM python:3.11-slim AS deps
 
 WORKDIR /code
@@ -26,7 +36,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 
-# ── Stage 2: runtime ─────────────────────────────────────────────────────────
+# ── Stage 3: runtime ─────────────────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
 
 WORKDIR /app
@@ -47,6 +57,10 @@ COPY backend/app /app/app
 # exist. Ship it, or the app builds a database that lacks every guarantee it
 # depends on (including the FKs that stop one user spending another's quota).
 COPY backend/schema.sql /app/schema.sql
+
+# The compiled SPA. Its presence flips mount_frontend() out of API-only mode:
+# uvicorn now serves index.html + /assets, so the whole app lives on one port.
+COPY --from=frontend /build/backend/static /app/static
 
 # Non-root: this process holds users' decrypted provider keys in memory, so it
 # should not also own the filesystem.

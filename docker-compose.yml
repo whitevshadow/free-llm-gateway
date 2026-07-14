@@ -1,19 +1,19 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  Multi-LLM Gateway — the whole project in Docker. THREE services.
+#  Multi-LLM Gateway — the whole project in Docker. TWO services, ONE port.
 #
 #      cp .env.example .env       # then fill SECRET_KEY + ENCRYPTION_KEY
 #      docker compose up -d --build
 #
-#      → http://localhost:8080          the UI  (nginx)
-#      → http://localhost:8080/v1/...   the API (proxied to app)
-#      → http://localhost:8080/docs     Swagger (proxied to app)
+#      → http://localhost:8080          the UI
+#      → http://localhost:8080/v1/...   the API
+#      → http://localhost:8080/docs     Swagger
 #
 #      docker compose logs app | grep -A2 "BOOTSTRAP ADMIN KEY"
 #        ^ your first admin key, printed ONCE. Copy it — it is unrecoverable.
 #
-#  EVERYTHING IS ONE ORIGIN. nginx serves the SPA and proxies /v1, /docs,
-#  /health to the app container, so the browser never talks to a second host.
-#  That is what lets us run with no CORS config at all.
+#  ONE PROCESS, ONE PORT, ONE ORIGIN. The `app` container's uvicorn serves the
+#  compiled SPA AND the API (mount_frontend, baked into the image), so the
+#  browser never talks to a second host — no nginx, and no CORS to configure.
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -44,10 +44,10 @@ services:
     # ports:
     #   - "5432:5432"
 
-  # ── app — FastAPI + LiteLLM. API only; it serves no HTML. ─────────────────
+  # ── app — FastAPI + LiteLLM. Serves the SPA AND the API on one port. ───────
   app:
     build:
-      context: .              # repo root: needs backend/schema.sql
+      context: .              # repo root: needs backend/ and frontend/
       dockerfile: Dockerfile
     image: multi-llm-gateway-api
     environment:
@@ -60,6 +60,11 @@ services:
 
       OWNER_EMAIL: ${OWNER_EMAIL:-admin@localhost}
       REQUIRE_GATEWAY_AUTH: ${REQUIRE_GATEWAY_AUTH:-true}
+      # Stable admin key. Set MASTER_ADMIN_KEY in .env to override; if unset, this
+      # falls back to the SAME hardcoded dev default baked into the code
+      # (config.py: DEFAULT_MASTER_ADMIN_KEY) — NOT an empty string, which would
+      # otherwise clobber that default. Change it in .env for any real deployment.
+      MASTER_ADMIN_KEY: ${MASTER_ADMIN_KEY:-sk-gw-master-dev-CHANGE-ME-a1b2c3d4e5f6}
       ENVIRONMENT: ${ENVIRONMENT:-production}
       DEBUG: ${DEBUG:-false}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -77,23 +82,10 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
-    # Not published. The ONLY way in is through nginx — so there is no second,
-    # unproxied door onto the API. Uncomment to hit uvicorn directly while debugging.
-    # ports:
-    #   - "8000:8000"
-
-  # ── web — nginx: serves the SPA, proxies the API ──────────────────────────
-  web:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    image: multi-llm-gateway-web
+    # The single public door: host ${PORT} → uvicorn on 8000, serving both the
+    # SPA and the API. Container PORT stays 8000 (the healthcheck reads it).
     ports:
-      - "${PORT:-8080}:80"
-    depends_on:
-      app:
-        condition: service_started
-    restart: unless-stopped
+      - "${PORT:-8080}:8000"
 
 volumes:
   pg_data:
