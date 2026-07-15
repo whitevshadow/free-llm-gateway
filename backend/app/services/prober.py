@@ -35,7 +35,7 @@ from app.models.enums import ModelHealth, ModelMode
 from app.models.provider import Provider
 from app.models.provider_key import ProviderKey
 from app.models.provider_model import ProviderModel
-from app.services import crypto
+from app.services import crypto, presets
 
 logger = logging.getLogger("gateway.prober")
 
@@ -243,7 +243,10 @@ async def probe_deployments(deployment_ids: List[int]) -> Dict:
         async def run(dep, model, key, provider):
             async with sem:
                 result = await _probe_one(
-                    model.litellm_model, plaintext[key.id], provider.base_url,
+                    model.litellm_model, plaintext[key.id],
+                    # Not provider.base_url verbatim: native-routing providers
+                    # (Cohere) must get None or the probe 404s (see presets).
+                    presets.call_api_base(provider.slug, provider.base_url),
                     mode=model.mode,
                 )
                 # Tick as each probe RETURNS, not when results are written — the

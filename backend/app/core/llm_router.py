@@ -50,7 +50,7 @@ from app.models.provider import Provider
 from app.models.provider_key import ProviderKey
 from app.models.router_config import RouterConfig
 from app.models.views import v_live_deployments
-from app.services import crypto
+from app.services import crypto, presets
 
 logger = logging.getLogger("gateway.router")
 
@@ -120,7 +120,11 @@ def _build(db: Session, user_id: int) -> Tuple[Router, List[str]]:
         for pk in db.query(ProviderKey).filter(ProviderKey.id.in_(key_ids)):
             plaintext[pk.id] = crypto.decrypt(pk.key_ciphertext)
 
-    bases = {p.id: p.base_url for p in db.query(Provider)}
+    # base_url is what discovery calls; native-routing providers (Cohere) must
+    # NOT receive it as api_base on real calls — litellm knows their endpoint.
+    bases = {
+        p.id: presets.call_api_base(p.slug, p.base_url) for p in db.query(Provider)
+    }
 
     model_list: List[Dict[str, Any]] = []
     for r in rows:

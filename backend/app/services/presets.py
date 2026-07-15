@@ -77,9 +77,16 @@ PRESETS: List[Dict[str, Optional[str]]] = [
     {
         "slug": "cohere",
         "name": "Cohere",
+        # The compatibility URL exists ONLY for discovery ({base}/models returns
+        # OpenAI-shaped JSON). It must NOT be sent as api_base on calls: litellm's
+        # `cohere/` prefix is a NATIVE integration that POSTs to api_base verbatim
+        # with Cohere's own protocol, so pointing it here 404s every model.
+        # native_routing tells the prober and Router to omit api_base and let
+        # litellm use Cohere's real endpoint, which it knows itself.
         "base_url": "https://api.cohere.ai/compatibility/v1",
+        "native_routing": True,
         "docs_url": "https://dashboard.cohere.com/api-keys",
-        "hint": "Free. 1,000 requests/month. Command family.",
+        "hint": "Free. 1,000 requests/month. Command family + embeddings.",
     },
     {
         "slug": "github",
@@ -118,3 +125,19 @@ def get(slug: str) -> Optional[Dict[str, Optional[str]]]:
 def base_url_for(slug: str) -> Optional[str]:
     p = get(slug)
     return p["base_url"] if p else None
+
+
+def call_api_base(slug: str, stored_base_url: Optional[str]) -> Optional[str]:
+    """
+    The api_base to pass on an ACTUAL litellm call for this provider — as opposed
+    to the base_url used for discovery.
+
+    For most providers these are the same OpenAI-compatible URL. For providers
+    marked native_routing (Cohere), litellm's own integration knows the real
+    endpoint and treats a supplied api_base as the literal URL to POST to — so we
+    must send None or every call 404s against the discovery URL.
+    """
+    p = get(slug)
+    if p and p.get("native_routing"):
+        return None
+    return stored_base_url
