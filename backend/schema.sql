@@ -531,7 +531,12 @@ SELECT
     -- Appended LAST on purpose — CREATE OR REPLACE VIEW may only add columns
     -- at the end, which is what lets a live DB upgrade without a rebuild.
     pm.mode                                     AS mode,
-    min(pm.publisher)                           AS publisher   -- appended last
+    min(pm.publisher)                           AS publisher,
+    -- Every distinct probe outcome across this model's deployments, so the UI
+    -- can say WHY a model is down (auth_error vs rate_limited vs 404), not just
+    -- that it is. Appended last (view-replace rule). NOTE: also mirrored in
+    -- database.py MIGRATIONS for live databases — keep the two in sync.
+    array_agg(DISTINCT d.status::text)          AS statuses
 FROM deployments d
 JOIN provider_models pm ON pm.id = d.provider_model_id
 JOIN providers       p  ON p.id  = d.provider_id

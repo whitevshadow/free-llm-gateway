@@ -56,7 +56,10 @@ v_my_models = Table(
     Column("total_providers", Integer),
     Column("last_checked_at", DateTime(timezone=True)),
     Column("mode", String),      # 'chat' | 'embedding'
-    Column("publisher", String), # normalized org — appended last (view-replace rule)
+    Column("publisher", String), # normalized org
+    # Distinct probe outcomes across this model's deployments ('available',
+    # 'rate_limited', 'auth_error', …) — lets the UI say WHY a model is down.
+    Column("statuses", ARRAY(String)),  # appended last (view-replace rule)
 )
 
 

@@ -534,6 +534,10 @@ async def my_models(user: User = Depends(current_user), db: Session = Depends(ge
                 "has_backup_provider": r["has_backup_provider"],
                 "live_keys": r["live_keys"],
                 "total_keys": r["total_keys"],
+                # Why the dead ones are dead: distinct deployment probe outcomes
+                # ('rate_limited', 'auth_error', …). The UI turns these into a
+                # reason badge instead of a flat "Unavailable".
+                "statuses": r["statuses"],
                 "last_checked_at": (
                     r["last_checked_at"].isoformat() if r["last_checked_at"] else None
                 ),

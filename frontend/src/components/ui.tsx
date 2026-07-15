@@ -191,6 +191,63 @@ export function RedundancyBadge({ model }: { model: MyModel }) {
   );
 }
 
+/**
+ * Classify a model's status into a REASON, not just up/down.
+ *
+ * A model row aggregates several deployments, so `statuses` can hold a mix
+ * (one key auth-dead, another rate-limited). We show the most ACTIONABLE
+ * reason: an auth failure needs the user to fix a key (nothing else will
+ * revive it), a 429 just needs patience, a 404 means the provider doesn't
+ * serve it to this account, and timeout/error mean "exists but inference
+ * failed". "Deprecated" is deliberately absent: when a provider removes a
+ * model, discovery drops it from the catalog entirely, so there is no row
+ * left to badge.
+ */
+export interface StatusInfo {
+  label: string;
+  dot: string;    // tailwind bg- class for the dot
+  text: string;   // tailwind text- class for the label
+  hint: string;   // tooltip
+}
+
+export function statusInfo(m: Pick<MyModel, "is_usable" | "statuses">): StatusInfo {
+  if (m.is_usable) {
+    return {
+      label: "Live", dot: "bg-emerald-500", text: "text-neutral-300",
+      hint: "Working normally — at least one of your keys answers.",
+    };
+  }
+  const s = new Set(m.statuses ?? []);
+  if (s.has("auth_error")) {
+    return {
+      label: "Auth failed", dot: "bg-sky-500", text: "text-sky-400",
+      hint: "Invalid or expired API key. No amount of waiting fixes this — replace the key under Providers & keys.",
+    };
+  }
+  if (s.has("rate_limited")) {
+    return {
+      label: "Rate limited", dot: "bg-orange-500", text: "text-orange-400",
+      hint: "The provider returned 429. Your key works — it's just throttled and will come back after its cooldown.",
+    };
+  }
+  if (s.has("unavailable")) {
+    return {
+      label: "No access", dot: "bg-red-500", text: "text-red-400",
+      hint: "The provider lists this model but doesn't serve it to your account (404).",
+    };
+  }
+  if (s.has("timeout") || s.has("error")) {
+    return {
+      label: "Check failed", dot: "bg-yellow-500", text: "text-yellow-400",
+      hint: "The model exists but the test request failed (timeout or provider error). Often transient — re-test.",
+    };
+  }
+  return {
+    label: "Unavailable", dot: "bg-neutral-600", text: "text-neutral-600",
+    hint: "Not yet probed.",
+  };
+}
+
 export function StatusDot({ ok, cooling }: { ok: boolean; cooling?: boolean }) {
   const cls = cooling
     ? "bg-amber-500"

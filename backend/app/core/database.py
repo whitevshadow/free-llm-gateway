@@ -79,6 +79,39 @@ MIGRATIONS = [
     "ALTER TABLE router_config "
     "ADD COLUMN IF NOT EXISTS pinned_provider_id BIGINT "
     "REFERENCES providers(id) ON DELETE SET NULL",
+    # v_my_models + statuses: the UI classifies WHY a model is down (auth_error
+    # vs rate_limited vs 404) instead of a flat "Unavailable". CREATE OR REPLACE
+    # VIEW is idempotent and may only APPEND columns — this definition must stay
+    # byte-for-byte in sync with the one in schema.sql.
+    """
+    CREATE OR REPLACE VIEW v_my_models AS
+    SELECT
+        d.user_id,
+        pm.normalized_name                          AS model,
+        array_agg(DISTINCT p.name ORDER BY p.name)  AS providers,
+        bool_or(pm.is_common)                       AS is_common,
+        count(*) FILTER (WHERE p.enabled AND is_callable(d.status, d.cooldown_until))
+                                                    AS live_keys,
+        count(DISTINCT d.provider_id)
+            FILTER (WHERE p.enabled AND is_callable(d.status, d.cooldown_until))
+                                                    AS live_providers,
+        count(*) FILTER (WHERE p.enabled AND is_callable(d.status, d.cooldown_until)) >= 2
+                                                    AS has_backup_key,
+        count(DISTINCT d.provider_id)
+            FILTER (WHERE p.enabled AND is_callable(d.status, d.cooldown_until)) >= 2
+                                                    AS has_backup_provider,
+        bool_or(p.enabled AND is_callable(d.status, d.cooldown_until)) AS is_usable,
+        count(*)                                    AS total_keys,
+        count(DISTINCT d.provider_id)               AS total_providers,
+        max(d.last_checked_at)                      AS last_checked_at,
+        pm.mode                                     AS mode,
+        min(pm.publisher)                           AS publisher,
+        array_agg(DISTINCT d.status::text)          AS statuses
+    FROM deployments d
+    JOIN provider_models pm ON pm.id = d.provider_model_id
+    JOIN providers       p  ON p.id  = d.provider_id
+    GROUP BY d.user_id, pm.normalized_name, pm.mode
+    """,
 ]
 
 

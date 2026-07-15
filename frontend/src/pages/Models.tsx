@@ -22,7 +22,7 @@ import { Link } from "react-router-dom";
 
 import { api } from "../lib/api";
 import type { MyModel } from "../lib/types";
-import { Empty, FilterDropdown, RedundancyBadge, Spinner, StatusDot } from "../components/ui";
+import { Empty, FilterDropdown, RedundancyBadge, Spinner, statusInfo } from "../components/ui";
 import ProbeProgress from "../components/ProbeProgress";
 
 interface ProviderGroup {
@@ -111,10 +111,19 @@ export default function Models() {
       .map(([value, count]) => ({ value, count }));
   }, [modeModels]);
 
-  const statusOptions = useMemo(() => ([
-    { value: "Live", count: modeModels.filter((m) => m.is_usable).length },
-    { value: "Unavailable", count: modeModels.filter((m) => !m.is_usable).length },
-  ]), [modeModels]);
+  // Status options are the classified REASONS (Live, Auth failed, Rate
+  // limited, No access, Check failed…) — only ones that actually occur.
+  const statusOptions = useMemo(() => {
+    const by = new Map<string, number>();
+    for (const m of modeModels) {
+      const { label } = statusInfo(m);
+      by.set(label, (by.get(label) ?? 0) + 1);
+    }
+    // Live first, then by count.
+    return [...by.entries()]
+      .sort((a, b) => (a[0] === "Live" ? -1 : b[0] === "Live" ? 1 : b[1] - a[1]))
+      .map(([value, count]) => ({ value, count }));
+  }, [modeModels]);
 
   const redundancyOptions = useMemo(() =>
     REDUNDANCY_OPTIONS.map((value) => ({
@@ -128,7 +137,7 @@ export default function Models() {
     return modeModels.filter((m) => {
       if (providerSel.size > 0 && !m.providers.some((p) => providerSel.has(p))) return false;
       if (publisherSel.size > 0 && !publisherSel.has(m.publisher ?? "Unknown")) return false;
-      if (statusSel.size > 0 && !statusSel.has(m.is_usable ? "Live" : "Unavailable")) return false;
+      if (statusSel.size > 0 && !statusSel.has(statusInfo(m).label)) return false;
       if (redundancySel.size > 0 && !redundancySel.has(redundancyOf(m))) return false;
       if (q && !m.model.toLowerCase().includes(q) &&
           !(m.publisher ?? "").toLowerCase().includes(q)) return false;
@@ -380,12 +389,15 @@ export default function Models() {
                 </td>
                 <td className="td"><RedundancyBadge model={m} /></td>
                 <td className="td">
-                  <span className="inline-flex items-center gap-2">
-                    <StatusDot ok={m.is_usable} />
-                    <span className={m.is_usable ? "text-neutral-300" : "text-neutral-600"}>
-                      {m.is_usable ? "Live" : "Unavailable"}
-                    </span>
-                  </span>
+                  {(() => {
+                    const info = statusInfo(m);
+                    return (
+                      <span className="inline-flex items-center gap-2" title={info.hint}>
+                        <span className={`inline-block h-2 w-2 rounded-full ${info.dot}`} />
+                        <span className={info.text}>{info.label}</span>
+                      </span>
+                    );
+                  })()}
                 </td>
                 <td className="td text-right">
                   {/* Embedding models can't chat, and a dead model can't answer —

@@ -55,6 +55,12 @@ export interface MyModel {
   has_backup_provider: boolean;
   live_keys: number;
   total_keys: number;
+  /**
+   * Distinct probe outcomes across this model's deployments:
+   * 'available' | 'rate_limited' | 'auth_error' | 'unavailable' | 'timeout' | 'error'.
+   * When is_usable is false, these say WHY (see statusInfo in ui.tsx).
+   */
+  statuses: string[];
   last_checked_at: string | null;
 }
 
