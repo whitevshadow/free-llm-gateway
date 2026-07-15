@@ -34,6 +34,14 @@ if DATABASE_URL.startswith("sqlite"):
         "isolation. Set DATABASE_URL to a postgresql:// URL."
     )
 
+# Managed hosts (Render, Railway, Heroku, Fly) hand out `postgres://` URLs, but
+# SQLAlchemy 1.4+ dropped that alias and needs an explicit driver. Normalise to
+# psycopg2 so a copy-pasted host URL Just Works instead of raising at startup.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len("postgres://"):]
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len("postgresql://"):]
+
 engine = create_engine(
     DATABASE_URL,
     echo=settings.DEBUG,

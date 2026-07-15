@@ -4,9 +4,11 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   build: {
-    // The backend's mount_frontend() serves this directory. Building here means
-    // one container and one port — no second service to deploy.
-    outDir: "../backend/static",
+    // Single-container (Docker/local): the backend's mount_frontend() serves
+    // ../backend/static, so uvicorn hosts UI + API on one port. On Vercel there
+    // is no backend to serve from, and Vercel expects the default `dist` inside
+    // the project root — so build there instead. Vercel sets VERCEL=1 for us.
+    outDir: process.env.VERCEL ? "dist" : "../backend/static",
     emptyOutDir: true,
   },
   server: {
