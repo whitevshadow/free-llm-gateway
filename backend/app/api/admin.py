@@ -17,10 +17,13 @@ the table" regardless of who was calling — is gone.
 
 from __future__ import annotations
 
+import csv
+import io
 import logging
+from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -491,6 +494,40 @@ async def list_my_provider_keys(
     return {"keys": key_store.list_keys(db, user_id=user.id)}
 
 
+@router.get("/v1/me/provider-keys/export")
+async def export_my_provider_keys(
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+):
+    """
+    Download MY provider keys — DECRYPTED — as a CSV backup.
+
+    This is the one deliberate exception to "the API never returns the secret":
+    a user restoring after a lost database needs the original keys back, and they
+    already own them. Scoped to the caller's own keys, served with no-store so
+    no proxy or browser cache ever holds the plaintext.
+    """
+    rows = key_store.export_keys(db, user_id=user.id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="You have no provider keys to export.")
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(
+        buf, fieldnames=["provider", "provider_name", "label", "api_key"]
+    )
+    writer.writeheader()
+    writer.writerows(rows)
+
+    filename = f"provider-keys-backup-{date.today().isoformat()}.csv"
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @router.delete("/v1/me/provider-keys/{key_id}")
 async def delete_my_provider_key(
     key_id: int, user: User = Depends(current_user), db: Session = Depends(get_db),
@@ -630,6 +667,54 @@ async def reprobe_my_models(
     """Re-test all MY deployments in the background."""
     background.add_task(_probe_user_and_refresh, user.id)
     return {"status": "probing", "detail": "Poll GET /v1/me/models for results."}
+
+
+@router.post("/v1/me/providers/{slug}/probe")
+async def reprobe_my_provider(
+    slug: str,
+    background: BackgroundTasks,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Re-test all MY keys at ONE provider — probe only, no catalog refresh.
+
+    The lighter sibling of /discover: it spends no quota on /models and touches
+    no other provider. Use it after fixing a key's permissions ("did that revive
+    HuggingFace?") without re-firing hundreds of probes at providers that were
+    fine.
+    """
+    prov = db.query(Provider).filter(Provider.slug == slug.lower()).first()
+    if not prov:
+        raise HTTPException(status_code=404, detail=f"No provider {slug!r}.")
+
+    my_keys = (
+        db.query(ProviderKey)
+        .filter(
+            ProviderKey.user_id == user.id,
+            ProviderKey.provider_id == prov.id,
+            ProviderKey.is_active.is_(True),
+        )
+        .all()
+    )
+    if not my_keys:
+        raise HTTPException(
+            status_code=400,
+            detail=f"You have no active {prov.name} key — nothing to test.",
+        )
+
+    for k in my_keys:
+        background.add_task(_probe_and_refresh, k.id, user.id)
+
+    return {
+        "status": "probing",
+        "provider": prov.slug,
+        "keys": len(my_keys),
+        "detail": (
+            f"Re-testing your {len(my_keys)} {prov.name} key(s) in the "
+            "background. Poll GET /v1/me/models for results."
+        ),
+    }
 
 
 async def _probe_user_and_refresh(user_id: int) -> None:

@@ -52,6 +52,32 @@ def reveal(db: Session, provider_key_id: int) -> str:
     return crypto.decrypt(row.key_ciphertext)
 
 
+def export_keys(db: Session, user_id: int) -> List[dict]:
+    """
+    Decrypt ALL of one user's keys for a backup download.
+
+    Same contract as reveal(): plaintext exists only in the return value, for the
+    duration of one request, and is never stored or logged. Scoped by user_id —
+    you can only export what you own.
+    """
+    rows = (
+        db.query(ProviderKey, Provider)
+        .join(Provider, ProviderKey.provider_id == Provider.id)
+        .filter(ProviderKey.user_id == user_id)
+        .order_by(Provider.slug, ProviderKey.id)
+        .all()
+    )
+    return [
+        {
+            "provider": prov.slug,
+            "provider_name": prov.name,
+            "label": pk.label,
+            "api_key": crypto.decrypt(pk.key_ciphertext),
+        }
+        for pk, prov in rows
+    ]
+
+
 def fan_out(db: Session, key: ProviderKey) -> int:
     """
     Create one deployment per catalog model this key's provider serves.

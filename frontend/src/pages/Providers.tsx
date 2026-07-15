@@ -77,6 +77,50 @@ export default function Providers() {
     onSettled: () => setDiscovering(null),
   });
 
+  // Per-provider "Test keys": probe-only, no catalog refresh, no /models call.
+  // The cheap way to answer "did fixing that key revive this provider?".
+  const [testing, setTesting] = useState<string | null>(null);
+  const testProvider = useMutation({
+    mutationFn: (slug: string) => api.reprobeProvider(slug),
+    onMutate: (slug) => {
+      setTesting(slug);
+      setDiscoverMsg(null);
+    },
+    onSuccess: (r) => {
+      setDiscoverMsg(r.detail);
+      // Probes land in the background — refresh the counts as they settle.
+      setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ["my-keys"] });
+        qc.invalidateQueries({ queryKey: ["my-models"] });
+      }, 3000);
+    },
+    onError: (e: ApiError) => setDiscoverMsg(e.message),
+    onSettled: () => setTesting(null),
+  });
+
+  // "Download backup": a CSV of every key, DECRYPTED — the originals, reusable
+  // as-is after a reinstall or lost database. The file is the secret; the UI
+  // never sees the plaintext.
+  const exportKeys = useMutation({
+    mutationFn: api.exportProviderKeys,
+    onMutate: () => setDiscoverMsg(null),
+    onError: (e: ApiError) => setDiscoverMsg(e.message),
+  });
+
+  // "Test all keys": every provider, every key — same as Models' Re-test all.
+  const testAll = useMutation({
+    mutationFn: api.reprobe,
+    onMutate: () => setDiscoverMsg(null),
+    onSuccess: () => {
+      setDiscoverMsg("Re-testing every key across all providers in the background.");
+      setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ["my-keys"] });
+        qc.invalidateQueries({ queryKey: ["my-models"] });
+      }, 3000);
+    },
+    onError: (e: ApiError) => setDiscoverMsg(e.message),
+  });
+
   if (providers.isLoading || keys.isLoading) return <Spinner />;
 
   const all = providers.data?.providers ?? [];
@@ -109,7 +153,29 @@ export default function Providers() {
             Your keys, encrypted at rest. They are never shown again after you save them.
           </p>
         </div>
-        <button className="btn-pri" onClick={() => setAdding(true)}>+ Add key</button>
+        <div className="flex gap-2">
+          {mine.length > 0 && (
+            <button
+              className="btn-sec"
+              onClick={() => exportKeys.mutate()}
+              disabled={exportKeys.isPending}
+              title="Download all your provider keys, unmasked, as a CSV backup. Keep the file somewhere safe — it contains the original secrets."
+            >
+              {exportKeys.isPending ? "Preparing…" : "⬇ Backup keys"}
+            </button>
+          )}
+          {mine.length > 0 && (
+            <button
+              className="btn-sec"
+              onClick={() => testAll.mutate()}
+              disabled={testAll.isPending || testing !== null || discovering !== null}
+              title="Re-test every key at every provider (same as Re-test all on the Models page)."
+            >
+              {testAll.isPending ? "Testing…" : "Test all keys"}
+            </button>
+          )}
+          <button className="btn-pri" onClick={() => setAdding(true)}>+ Add key</button>
+        </div>
       </div>
 
       <ProbeProgress />
@@ -136,8 +202,18 @@ export default function Providers() {
                   {ks.length > 0 && (
                     <button
                       className="btn-sec text-xs"
+                      onClick={() => testProvider.mutate(p.slug)}
+                      disabled={testing !== null || discovering !== null}
+                      title="Re-test your keys against this provider's existing catalog. No discovery call, other providers untouched."
+                    >
+                      {testing === p.slug ? "Testing…" : "Test keys"}
+                    </button>
+                  )}
+                  {ks.length > 0 && (
+                    <button
+                      className="btn-sec text-xs"
                       onClick={() => discover.mutate(p.slug)}
-                      disabled={discovering !== null}
+                      disabled={discovering !== null || testing !== null}
                       title="Refresh this provider's model list using your key, then re-test all your keys for it."
                     >
                       {discovering === p.slug ? "Discovering…" : "Discover models"}

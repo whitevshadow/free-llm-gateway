@@ -88,6 +88,34 @@ export const api = {
     }),
   deleteProviderKey: (id: number) =>
     request<void>(`/v1/me/provider-keys/${id}`, { method: "DELETE" }),
+  /**
+   * Download my provider keys — decrypted — as a CSV backup. Not request<T>:
+   * the response is a file, not JSON, and we hand it straight to the browser's
+   * download machinery without ever holding the plaintext in app state.
+   */
+  exportProviderKeys: async (): Promise<void> => {
+    const token = getKey();
+    const res = await fetch("/v1/me/provider-keys/export", {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        detail = (await res.json()).detail ?? detail;
+      } catch { /* non-JSON */ }
+      throw new ApiError(res.status, String(detail));
+    }
+    const blob = await res.blob();
+    const filename =
+      res.headers.get("Content-Disposition")?.match(/filename="([^"]+)"/)?.[1] ??
+      "provider-keys-backup.csv";
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
 
   // ── my models ──
   myModels: () => request<{ models: MyModel[] }>("/v1/me/models"),
@@ -96,6 +124,13 @@ export const api = {
   discoverMyProvider: (slug: string) =>
     request<{ status: string; added: number; detail: string }>(
       `/v1/me/providers/${slug}/discover`,
+      { method: "POST" },
+    ),
+  // Probe-only sibling of discover: re-test my keys at ONE provider, no catalog
+  // refresh, other providers untouched.
+  reprobeProvider: (slug: string) =>
+    request<{ status: string; keys: number; detail: string }>(
+      `/v1/me/providers/${slug}/probe`,
       { method: "POST" },
     ),
   // How far along my background probes are — powers the progress bar.
