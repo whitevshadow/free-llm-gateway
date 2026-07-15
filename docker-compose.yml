@@ -53,6 +53,13 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD:-gateway}@postgres:5432/${POSTGRES_DB:-gateway}
 
+      # PORT (from .env / Coolify UI) is the single source of truth for the
+      # app's listening port: uvicorn binds it, the Docker healthcheck probes
+      # it, and the ports: mapping below publishes it. Change it in ONE place.
+      # IMPORTANT (Coolify): the service domain must carry the same port —
+      # e.g. https://your.domain:1050 when PORT=1050 — or Traefik 502s.
+      PORT: ${PORT:-1080}
+
       SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
       # Encrypts users' provider keys at rest. If this ever changes, every stored
       # provider key becomes undecryptable. Set it once and back it up.
@@ -82,10 +89,11 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
-    # The single public door: host ${PORT} → uvicorn on 8000, serving both the
-    # SPA and the API. Container PORT stays 8000 (the healthcheck reads it).
+    # The single public door: uvicorn listens on ${PORT} inside the container
+    # and the same number is published on the host, so URL, proxy target and
+    # process all agree. Set PORT once in .env (or the Coolify UI).
     ports:
-      - "${PORT:-8080}:8000"
+      - "${PORT:-8000}:${PORT:-8000}"
 
 volumes:
   pg_data:
