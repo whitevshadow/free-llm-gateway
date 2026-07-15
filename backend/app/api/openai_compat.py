@@ -1,5 +1,7 @@
 """
-OpenAI-compatible endpoints — `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`.
+OpenAI-compatible endpoints — `/v1/chat/completions`, `/v1/embeddings`,
+`/v1/images/generations`, `/v1/audio/transcriptions`, `/v1/audio/speech`,
+`/v1/models`.
 
 Drop-in surface for any OpenAI client (the OpenAI SDK, Cursor, Continue,
 LangChain, curl):
@@ -19,13 +21,14 @@ deployment registered under it — across both the user's keys and their provide
 
 from __future__ import annotations
 
+import io
 import json
 import time
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -215,3 +218,178 @@ async def embeddings(
         status_code=200,
     )
     return result
+
+
+def _resolve_or_404(user: User, db: Session, requested: Optional[str]) -> str:
+    """Map the client's model spelling onto one of the caller's live families."""
+    available = router_svc.list_models(user.id, db)
+    resolved = resolve_requested_model(requested or "", set(available))
+    if not resolved:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model {requested!r} is not available to you. Yours: {available}",
+        )
+    return resolved
+
+
+@router.post("/v1/images/generations")
+async def image_generations(
+    request: Request,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Image generation, served from THIS USER's live image deployments."""
+    try:
+        body: Dict[str, Any] = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body.")
+
+    if not body.get("prompt"):
+        raise HTTPException(status_code=400, detail="'prompt' is required.")
+
+    requested = body.get("model")
+    body["model"] = _resolve_or_404(user, db, requested)
+
+    lr = router_svc.get_router(user.id, db)
+    start = time.perf_counter()
+    try:
+        response = await lr.aimage_generation(**body)
+    except Exception as exc:
+        log_v1_usage(
+            user_id=user.id, requested_model=requested,
+            latency=round(time.perf_counter() - start, 3),
+            status_code=502, error_message=str(exc),
+        )
+        logger.warning("image generation failed (user %s): %s", user.id, exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    result = _to_dict(response)
+    dep_id = _deployment_id(response)
+    if dep_id:
+        router_svc.record_success(dep_id)
+    log_v1_usage(
+        user_id=user.id,
+        requested_model=requested,
+        answered_deploy_id=dep_id,
+        usage=result.get("usage"),
+        latency=round(time.perf_counter() - start, 3),
+        status_code=200,
+    )
+    return result
+
+
+@router.post("/v1/audio/transcriptions")
+async def audio_transcriptions(
+    file: UploadFile = File(...),
+    model: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    temperature: Optional[float] = Form(None),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Speech-to-text (multipart, OpenAI-shaped), from the user's audio deployments."""
+    resolved = _resolve_or_404(user, db, model)
+
+    # litellm hands the upload to the provider SDK, which reads the filename
+    # (and thus the format) off the stream — so it must carry a name.
+    raw = await file.read()
+    buf = io.BytesIO(raw)
+    buf.name = file.filename or "audio.wav"
+
+    kwargs: Dict[str, Any] = {"model": resolved, "file": buf}
+    if language:
+        kwargs["language"] = language
+    if prompt:
+        kwargs["prompt"] = prompt
+    if response_format:
+        kwargs["response_format"] = response_format
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+
+    lr = router_svc.get_router(user.id, db)
+    start = time.perf_counter()
+    try:
+        response = await lr.atranscription(**kwargs)
+    except Exception as exc:
+        log_v1_usage(
+            user_id=user.id, requested_model=model,
+            latency=round(time.perf_counter() - start, 3),
+            status_code=502, error_message=str(exc),
+        )
+        logger.warning("transcription failed (user %s): %s", user.id, exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    result = _to_dict(response)
+    dep_id = _deployment_id(response)
+    if dep_id:
+        router_svc.record_success(dep_id)
+    log_v1_usage(
+        user_id=user.id,
+        requested_model=model,
+        answered_deploy_id=dep_id,
+        usage=result.get("usage"),
+        latency=round(time.perf_counter() - start, 3),
+        status_code=200,
+    )
+    return result
+
+
+# What /v1/audio/speech hands back per response_format. Anything unlisted
+# falls through to audio/mpeg — OpenAI's own default is mp3.
+_SPEECH_MEDIA_TYPES = {
+    "mp3": "audio/mpeg", "opus": "audio/opus", "aac": "audio/aac",
+    "flac": "audio/flac", "wav": "audio/wav", "pcm": "audio/pcm",
+}
+
+
+@router.post("/v1/audio/speech")
+async def audio_speech(
+    request: Request,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Text-to-speech. Returns raw audio bytes, like OpenAI's endpoint."""
+    try:
+        body: Dict[str, Any] = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body.")
+
+    if not body.get("input"):
+        raise HTTPException(status_code=400, detail="'input' is required.")
+    if not body.get("voice"):
+        # Voices are provider-specific; guessing one would 400 upstream anyway.
+        raise HTTPException(status_code=400, detail="'voice' is required.")
+
+    requested = body.get("model")
+    body["model"] = _resolve_or_404(user, db, requested)
+
+    lr = router_svc.get_router(user.id, db)
+    start = time.perf_counter()
+    try:
+        response = await lr.aspeech(**body)
+        audio = response.read() if hasattr(response, "read") else bytes(response.content)
+    except Exception as exc:
+        log_v1_usage(
+            user_id=user.id, requested_model=requested,
+            latency=round(time.perf_counter() - start, 3),
+            status_code=502, error_message=str(exc),
+        )
+        logger.warning("speech failed (user %s): %s", user.id, exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    dep_id = _deployment_id(response)
+    if dep_id:
+        router_svc.record_success(dep_id)
+    log_v1_usage(
+        user_id=user.id,
+        requested_model=requested,
+        answered_deploy_id=dep_id,
+        latency=round(time.perf_counter() - start, 3),
+        status_code=200,
+    )
+    media = _SPEECH_MEDIA_TYPES.get(
+        str(body.get("response_format", "mp3")).lower(), "audio/mpeg"
+    )
+    return Response(content=audio, media_type=media)

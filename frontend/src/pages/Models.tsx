@@ -45,7 +45,7 @@ export default function Models() {
   const { data, isLoading } = useQuery({ queryKey: ["my-models"], queryFn: api.myModels });
 
   // ── filter state — all combinable ──
-  const [mode, setMode] = useState<"chat" | "embedding">("chat");
+  const [mode, setMode] = useState<"chat" | "embedding" | "image" | "audio">("chat");
   const [search, setSearch] = useState("");
   const [providerSel, setProviderSel] = useState<Set<string>>(new Set());
   const [publisherSel, setPublisherSel] = useState<Set<string>>(new Set());
@@ -63,10 +63,16 @@ export default function Models() {
 
   const models = data?.models ?? [];
   const chatModels = useMemo(
-    () => models.filter((m) => m.mode !== "embedding"), [models],
+    () => models.filter((m) => m.mode === "chat"), [models],
   );
   const embModels = useMemo(
     () => models.filter((m) => m.mode === "embedding"), [models],
+  );
+  const imgModels = useMemo(
+    () => models.filter((m) => m.mode === "image"), [models],
+  );
+  const audModels = useMemo(
+    () => models.filter((m) => m.mode === "audio"), [models],
   );
 
   // Provider cards are a lens over CHAT models; a multi-provider model appears
@@ -90,7 +96,10 @@ export default function Models() {
 
   // Dropdown option counts are computed over the current MODE's models so the
   // numbers match what ticking the option can actually surface.
-  const modeModels = mode === "embedding" ? embModels : chatModels;
+  const modeModels =
+    mode === "embedding" ? embModels :
+    mode === "image" ? imgModels :
+    mode === "audio" ? audModels : chatModels;
 
   const providerOptions = useMemo(() => {
     const by = new Map<string, number>();
@@ -189,7 +198,7 @@ export default function Models() {
   }
 
   const tableTitle =
-    `${shown.length} ${mode === "embedding" ? "embedding" : "chat"} model${shown.length === 1 ? "" : "s"}` +
+    `${shown.length} ${mode} model${shown.length === 1 ? "" : "s"}` +
     (anyFilter ? " (filtered)" : "");
 
   return (
@@ -265,34 +274,48 @@ export default function Models() {
           );
         })}
 
-        {/* Embeddings are a different surface (/v1/embeddings), hence a mode
-            switch on the table rather than rows mixed into chat counts. */}
-        {embModels.length > 0 && (
-          <button
-            onClick={() => setMode((m) => (m === "embedding" ? "chat" : "embedding"))}
-            className={`card text-left transition-colors ${
-              mode === "embedding" ? "border-purple-700 bg-purple-950/20" : "hover:border-neutral-700"
-            }`}
-          >
-            <div className="flex items-center justify-between">
-              <h2 className="font-medium text-purple-300">Embeddings</h2>
-              <span className={`text-xs ${mode === "embedding" ? "text-purple-400" : "text-neutral-600"}`}>
-                {mode === "embedding" ? "showing ▾" : "click to view"}
-              </span>
-            </div>
-            <div className="mt-3 flex items-end gap-5">
-              <div>
-                <div className="text-2xl font-semibold tabular-nums text-neutral-100">
-                  {embModels.filter((m) => m.is_usable).length}
-                  <span className="text-sm font-normal text-neutral-600">
-                    /{embModels.length}
-                  </span>
-                </div>
-                <div className="text-xs text-neutral-600">models live</div>
+        {/* Embeddings, image and audio models are different surfaces
+            (/v1/embeddings, /v1/images/generations, /v1/audio/*), hence mode
+            switches on the table rather than rows mixed into chat counts. */}
+        {([
+          { key: "embedding", title: "Embeddings", ms: embModels,
+            via: "via /v1/embeddings",
+            sel: "border-purple-700 bg-purple-950/20", head: "text-purple-300", hint: "text-purple-400" },
+          { key: "image", title: "Image generation", ms: imgModels,
+            via: "via /v1/images/generations",
+            sel: "border-sky-700 bg-sky-950/20", head: "text-sky-300", hint: "text-sky-400" },
+          { key: "audio", title: "Audio (STT / TTS)", ms: audModels,
+            via: "via /v1/audio/*",
+            sel: "border-rose-700 bg-rose-950/20", head: "text-rose-300", hint: "text-rose-400" },
+        ] as const).map(({ key, title, ms, via, sel, head, hint }) =>
+          ms.length > 0 && (
+            <button
+              key={key}
+              onClick={() => setMode((m) => (m === key ? "chat" : key))}
+              className={`card text-left transition-colors ${
+                mode === key ? sel : "hover:border-neutral-700"
+              }`}
+            >
+              <div className="flex items-center justify-between">
+                <h2 className={`font-medium ${head}`}>{title}</h2>
+                <span className={`text-xs ${mode === key ? hint : "text-neutral-600"}`}>
+                  {mode === key ? "showing ▾" : "click to view"}
+                </span>
               </div>
-              <div className="pb-1 text-xs text-neutral-600">via /v1/embeddings</div>
-            </div>
-          </button>
+              <div className="mt-3 flex items-end gap-5">
+                <div>
+                  <div className="text-2xl font-semibold tabular-nums text-neutral-100">
+                    {ms.filter((m) => m.is_usable).length}
+                    <span className="text-sm font-normal text-neutral-600">
+                      /{ms.length}
+                    </span>
+                  </div>
+                  <div className="text-xs text-neutral-600">models live</div>
+                </div>
+                <div className="pb-1 text-xs text-neutral-600">{via}</div>
+              </div>
+            </button>
+          ),
         )}
       </div>
 
@@ -371,6 +394,16 @@ export default function Models() {
                       embedding
                     </span>
                   )}
+                  {m.mode === "image" && (
+                    <span className="ml-2 rounded bg-sky-950/60 px-1.5 py-0.5 text-[10px] text-sky-400">
+                      image
+                    </span>
+                  )}
+                  {m.mode === "audio" && (
+                    <span className="ml-2 rounded bg-rose-950/60 px-1.5 py-0.5 text-[10px] text-rose-400">
+                      audio
+                    </span>
+                  )}
                   {/* is_common is a catalog badge — NOT a promise that YOU have
                       a fallback. Rendered dim, never as reassurance. */}
                   {m.is_common && (
@@ -400,9 +433,9 @@ export default function Models() {
                   })()}
                 </td>
                 <td className="td text-right">
-                  {/* Embedding models can't chat, and a dead model can't answer —
-                      only live chat rows get the shortcut. */}
-                  {m.mode !== "embedding" && m.is_usable && (
+                  {/* Only chat models can converse, and a dead model can't
+                      answer — only live chat rows get the shortcut. */}
+                  {m.mode === "chat" && m.is_usable && (
                     <Link
                       to={`/playground?model=${encodeURIComponent(m.model)}`}
                       className="rounded-lg border border-neutral-800 px-2.5 py-1 text-xs

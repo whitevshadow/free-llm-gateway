@@ -44,7 +44,7 @@ export interface MyProviderKey {
  */
 export interface MyModel {
   model: string;
-  /** 'chat' | 'embedding' — different surfaces (/chat/completions vs /embeddings). */
+  /** 'chat' | 'embedding' | 'image' | 'audio' — each is its own /v1 surface. */
   mode: string;
   /** Normalized publishing org ('Meta', 'Mistral AI') — powers the right-side filter. */
   publisher: string | null;

@@ -50,9 +50,10 @@ export default function Playground() {
   const threadRef = useRef<HTMLDivElement | null>(null);
   const textRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Embedding models can't answer a chat — they belong to /v1/embeddings.
+  // Only chat models can answer here — embedding/image/audio models belong
+  // to their own /v1 surfaces.
   const usable = (models.data?.models ?? []).filter(
-    (m) => m.is_usable && m.mode !== "embedding",
+    (m) => m.is_usable && m.mode === "chat",
   );
 
   // Default once models load: the ?model= from a "Try" link if it's actually

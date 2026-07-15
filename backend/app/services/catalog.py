@@ -38,6 +38,20 @@ logger = logging.getLogger("gateway.catalog")
 # they get probed with an embedding call and shown in their own card.
 _CHAT_JUNK = ("-ocr", "ocrnet", "guard")
 
+# Name tokens that identify image-GENERATION models (served via
+# /v1/images/generations). Deliberately conservative: vision-capable CHAT
+# models (gpt-4o, llama-4 scout) must stay mode='chat' — they answer
+# /chat/completions, images go IN, not out.
+_IMAGE_TOKENS = (
+    "dall-e", "gpt-image", "flux", "stable-diffusion", "sdxl",
+    "sd3", "imagen", "-img2img", "-text2img",
+)
+
+# Audio models: speech-to-text (whisper/…-transcribe) and text-to-speech
+# (…-tts/tts-…). Both live under mode='audio'; the probe and the endpoints
+# tell them apart by name (see audio_kind).
+_AUDIO_TOKENS = ("whisper", "-tts", "tts-", "transcribe", "/tts")
+
 
 def _infer_mode(model_id: str) -> ModelMode:
     lowered = model_id.lower()
@@ -45,7 +59,23 @@ def _infer_mode(model_id: str) -> ModelMode:
         return ModelMode.embedding
     if "rerank" in lowered:
         return ModelMode.rerank
+    if any(tok in lowered for tok in _AUDIO_TOKENS):
+        return ModelMode.audio
+    if any(tok in lowered for tok in _IMAGE_TOKENS):
+        return ModelMode.image
     return ModelMode.chat
+
+
+def audio_kind(model_id: str) -> str:
+    """
+    'transcription' (speech→text, e.g. whisper) or 'speech' (text→speech,
+    e.g. playai-tts). Within mode='audio' these are different call shapes —
+    a TTS model cannot transcribe, so the probe and endpoints must not mix them.
+    """
+    lowered = model_id.lower()
+    if any(tok in lowered for tok in ("whisper", "transcribe")):
+        return "transcription"
+    return "speech"
 
 
 def _rotation_index(count: int, when: Optional[date] = None) -> int:
@@ -150,10 +180,11 @@ def discover_provider(
 
     for mid in ids:
         mode = _infer_mode(mid)
-        # Chat and embedding models are both first-class; rerankers and the
-        # rest can serve neither /chat/completions nor /embeddings, so they
-        # never enter the catalog.
-        if mode not in (ModelMode.chat, ModelMode.embedding):
+        # Chat, embedding, image and audio models are all first-class — each
+        # has its own /v1 surface and its own probe. Only rerankers stay out:
+        # nothing here can serve one.
+        if mode not in (ModelMode.chat, ModelMode.embedding,
+                        ModelMode.image, ModelMode.audio):
             continue
         if mode is ModelMode.chat and any(tok in mid.lower() for tok in _CHAT_JUNK):
             continue

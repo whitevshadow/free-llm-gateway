@@ -19,9 +19,12 @@ marked 'unavailable', and this promotes them as results land.
 """
 
 import asyncio
+import io
 import logging
 import math
+import struct
 import time
+import wave
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional, Tuple
@@ -36,6 +39,7 @@ from app.models.provider import Provider
 from app.models.provider_key import ProviderKey
 from app.models.provider_model import ProviderModel
 from app.services import crypto, presets
+from app.services.catalog import audio_kind
 
 logger = logging.getLogger("gateway.prober")
 
@@ -160,6 +164,41 @@ def _classify(exc: Exception) -> Tuple[ModelHealth, Optional[int], str]:
     return ModelHealth.error, code, msg
 
 
+# ── mode-specific probe payloads ─────────────────────────────────────────────
+
+def _probe_wav() -> io.BytesIO:
+    """
+    A fresh ~0.25s 8kHz mono WAV of a faint tone, generated in memory — the
+    smallest thing a transcription endpoint will accept as real audio. Fresh
+    per call: the upload consumes the stream, so it cannot be a shared constant.
+    """
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        frames = 2000
+        w.writeframes(b"".join(
+            struct.pack("<h", 800 if (i // 20) % 2 == 0 else -800)
+            for i in range(frames)
+        ))
+    buf.seek(0)
+    buf.name = "ping.wav"   # litellm/openai read the filename from here
+    return buf
+
+
+# TTS models refuse a call without a voice, and voices are provider-specific:
+# Groq's PlayAI models only accept PlayAI voices, OpenAI-compatible ones take
+# 'alloy'. Wrong voice = 400 = a healthy model probed dead, so this map matters.
+_TTS_VOICES = {"groq": "Fritz-PlayAI"}
+_TTS_VOICE_DEFAULT = "alloy"
+
+
+def probe_tts_voice(litellm_model: str) -> str:
+    slug = litellm_model.split("/", 1)[0]
+    return _TTS_VOICES.get(slug, _TTS_VOICE_DEFAULT)
+
+
 async def _probe_one(
     litellm_model: str, api_key: str, api_base: Optional[str],
     mode: ModelMode = ModelMode.chat,
@@ -170,7 +209,8 @@ async def _probe_one(
     THE PROBE MUST MATCH THE MODE. An embedding model cannot answer a chat
     completion, so probing it with one would mark every embedding model dead
     forever. Chat models get a 1-token completion; embedding models embed the
-    word "ping".
+    word "ping"; whisper-family models transcribe a ~0.25s generated WAV; TTS
+    models speak "ping"; image models generate one small image.
     """
     started = datetime.now(timezone.utc)
     try:
@@ -187,6 +227,32 @@ async def _probe_one(
                 api_base=api_base,
                 timeout=PROBE_TIMEOUT,
                 **kwargs,
+            )
+        elif mode is ModelMode.audio:
+            if audio_kind(litellm_model) == "transcription":
+                await litellm.atranscription(
+                    model=litellm_model,
+                    file=_probe_wav(),
+                    api_key=api_key,
+                    api_base=api_base,
+                    timeout=PROBE_TIMEOUT,
+                )
+            else:
+                await litellm.aspeech(
+                    model=litellm_model,
+                    input="ping",
+                    voice=probe_tts_voice(litellm_model),
+                    api_key=api_key,
+                    api_base=api_base,
+                    timeout=PROBE_TIMEOUT,
+                )
+        elif mode is ModelMode.image:
+            await litellm.aimage_generation(
+                model=litellm_model,
+                prompt="ping",
+                api_key=api_key,
+                api_base=api_base,
+                timeout=PROBE_TIMEOUT,
             )
         else:
             await litellm.acompletion(
