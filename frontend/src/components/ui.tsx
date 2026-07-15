@@ -1,6 +1,103 @@
 /** Small shared pieces used across pages. */
 
+import { useEffect, useRef, useState } from "react";
+
 import type { MyModel } from "../lib/types";
+
+/**
+ * Multi-select filter dropdown. Empty selection means "no constraint" — the
+ * button then reads "Label: All". Options carry an optional count so the user
+ * can see what a tick will give them BEFORE clicking (mirrors the counts the
+ * old publisher sidebar showed).
+ */
+export function FilterDropdown({
+  label, options, selected, onChange,
+}: {
+  label: string;
+  options: { value: string; count?: number }[];
+  selected: Set<string>;
+  onChange: (next: Set<string>) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onDocClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [open]);
+
+  function toggle(value: string) {
+    const next = new Set(selected);
+    if (next.has(value)) next.delete(value);
+    else next.add(value);
+    onChange(next);
+  }
+
+  const active = selected.size > 0;
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm transition-colors ${
+          active
+            ? "border-emerald-700 bg-emerald-950/20 text-emerald-300"
+            : "border-neutral-800 bg-neutral-900 text-neutral-400 hover:border-neutral-700"
+        }`}
+      >
+        {label}:{" "}
+        <span className={active ? "font-medium" : ""}>
+          {active ? (selected.size === 1 ? [...selected][0] : selected.size) : "All"}
+        </span>
+        <span className="text-xs opacity-60">▾</span>
+      </button>
+
+      {open && (
+        <div className="absolute left-0 top-full z-20 mt-1 w-64 rounded-xl border border-neutral-800 bg-neutral-900 p-1 shadow-xl">
+          {active && (
+            <button
+              type="button"
+              className="mb-1 w-full rounded-lg px-2 py-1.5 text-left text-xs text-neutral-500 hover:bg-neutral-800/60 hover:text-neutral-300"
+              onClick={() => onChange(new Set())}
+            >
+              Clear ({label}: All)
+            </button>
+          )}
+          <ul className="max-h-72 overflow-y-auto">
+            {options.map(({ value, count }) => {
+              const checked = selected.has(value);
+              return (
+                <li key={value}>
+                  <label
+                    className={`flex cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm transition-colors hover:bg-neutral-800/60 ${
+                      checked ? "text-neutral-100" : "text-neutral-400"
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => toggle(value)}
+                      className="h-4 w-4 rounded accent-emerald-600"
+                    />
+                    <span className="flex-1 truncate">{value}</span>
+                    {count !== undefined && (
+                      <span className="tabular-nums text-xs text-neutral-600">{count}</span>
+                    )}
+                  </label>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function StatCard({
   label, value, sub, tone = "default",

@@ -5,14 +5,15 @@
  * they hold no key for cannot appear here — not because we filter it out, but
  * because the row cannot exist (it only exists through their key, FK-enforced).
  *
- * TWO FILTER AXES, ONE AT A TIME (deliberate, per design decision):
- *   • cards (providers + Embeddings) — "what can I reach through X"
- *   • the publisher panel on the right — "everything by Meta, wherever it runs"
- * Selecting on one axis clears the other; mixing them ("Meta via Groq") reads
- * as power but mostly produces confusing empty tables.
+ * FILTERING: one combinable filter bar (search + Provider + Publisher +
+ * Status + Redundancy dropdowns). Every control narrows the table together —
+ * OR within a dropdown, AND across dropdowns. The provider cards are shortcuts
+ * that toggle the Provider filter; the Embeddings card switches the table to
+ * embedding models (a different surface, /v1/embeddings, so it's a mode switch
+ * rather than a filter).
  *
- * The unavailable toggle intersects with whichever axis is active — hiding dead
- * rows is a display preference, not a filter.
+ * Status defaults to Live: with NVIDIA, more than half the catalog can't
+ * answer a probe, and a wall of grey rows buries the usable ones.
  */
 
 import { useMemo, useState } from "react";
@@ -21,7 +22,7 @@ import { Link } from "react-router-dom";
 
 import { api } from "../lib/api";
 import type { MyModel } from "../lib/types";
-import { Empty, RedundancyBadge, Spinner, StatusDot } from "../components/ui";
+import { Empty, FilterDropdown, RedundancyBadge, Spinner, StatusDot } from "../components/ui";
 import ProbeProgress from "../components/ProbeProgress";
 
 interface ProviderGroup {
@@ -31,15 +32,27 @@ interface ProviderGroup {
   exposed: number;   // usable but with no backup — the actionable number
 }
 
+const REDUNDANCY_OPTIONS = ["Provider backup", "Key backup", "No backup"] as const;
+
+function redundancyOf(m: MyModel): (typeof REDUNDANCY_OPTIONS)[number] {
+  if (m.has_backup_provider) return "Provider backup";
+  if (m.has_backup_key) return "Key backup";
+  return "No backup";
+}
+
 export default function Models() {
   const qc = useQueryClient();
   const { data, isLoading } = useQuery({ queryKey: ["my-models"], queryFn: api.myModels });
 
-  const [selected, setSelected] = useState<string | null>(null);
-  const [publishers, setPublishers] = useState<Set<string>>(new Set());
-  // Unavailable models are HIDDEN by default: with NVIDIA, more than half the
-  // catalog can't answer a probe, and a wall of grey rows buries the live ones.
-  const [showUnavailable, setShowUnavailable] = useState(false);
+  // ── filter state — all combinable ──
+  const [mode, setMode] = useState<"chat" | "embedding">("chat");
+  const [search, setSearch] = useState("");
+  const [providerSel, setProviderSel] = useState<Set<string>>(new Set());
+  const [publisherSel, setPublisherSel] = useState<Set<string>>(new Set());
+  // Live pre-ticked = the old "hide unavailable by default" behavior, but now
+  // it's just a filter the user can see and change like any other.
+  const [statusSel, setStatusSel] = useState<Set<string>>(new Set(["Live"]));
+  const [redundancySel, setRedundancySel] = useState<Set<string>>(new Set());
 
   const reprobe = useMutation({
     mutationFn: api.reprobe,
@@ -75,16 +88,53 @@ export default function Models() {
       .sort((a, b) => b.models.length - a.models.length);
   }, [chatModels]);
 
-  // Publisher counts across ALL models (chat + embedding), sorted by count —
-  // the right-hand panel, mirroring build.nvidia.com's filter.
-  const publisherCounts = useMemo(() => {
+  // Dropdown option counts are computed over the current MODE's models so the
+  // numbers match what ticking the option can actually surface.
+  const modeModels = mode === "embedding" ? embModels : chatModels;
+
+  const providerOptions = useMemo(() => {
     const by = new Map<string, number>();
-    for (const m of models) {
+    for (const m of modeModels) for (const p of m.providers) by.set(p, (by.get(p) ?? 0) + 1);
+    return [...by.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([value, count]) => ({ value, count }));
+  }, [modeModels]);
+
+  const publisherOptions = useMemo(() => {
+    const by = new Map<string, number>();
+    for (const m of modeModels) {
       const pub = m.publisher ?? "Unknown";
       by.set(pub, (by.get(pub) ?? 0) + 1);
     }
-    return [...by.entries()].sort((a, b) => b[1] - a[1]);
-  }, [models]);
+    return [...by.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([value, count]) => ({ value, count }));
+  }, [modeModels]);
+
+  const statusOptions = useMemo(() => ([
+    { value: "Live", count: modeModels.filter((m) => m.is_usable).length },
+    { value: "Unavailable", count: modeModels.filter((m) => !m.is_usable).length },
+  ]), [modeModels]);
+
+  const redundancyOptions = useMemo(() =>
+    REDUNDANCY_OPTIONS.map((value) => ({
+      value,
+      count: modeModels.filter((m) => redundancyOf(m) === value).length,
+    })), [modeModels]);
+
+  // ── apply every filter: OR inside a dropdown, AND across dropdowns ──
+  const shown = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return modeModels.filter((m) => {
+      if (providerSel.size > 0 && !m.providers.some((p) => providerSel.has(p))) return false;
+      if (publisherSel.size > 0 && !publisherSel.has(m.publisher ?? "Unknown")) return false;
+      if (statusSel.size > 0 && !statusSel.has(m.is_usable ? "Live" : "Unavailable")) return false;
+      if (redundancySel.size > 0 && !redundancySel.has(redundancyOf(m))) return false;
+      if (q && !m.model.toLowerCase().includes(q) &&
+          !(m.publisher ?? "").toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [modeModels, providerSel, publisherSel, statusSel, redundancySel, search]);
 
   if (isLoading) return <Spinner />;
 
@@ -100,276 +150,263 @@ export default function Models() {
   }
 
   const exposed = chatModels.filter((m) => m.is_usable && !m.has_backup_key).length;
-  const embSelected = selected === "__embeddings__";
-  const active = selected && !embSelected ? groups.find((g) => g.name === selected) : null;
 
-  // One axis at a time: publishers win when any are ticked.
-  const inScope =
-    publishers.size > 0
-      ? models.filter((m) => publishers.has(m.publisher ?? "Unknown"))
-      : embSelected
-      ? embModels
-      : active
-      ? active.models
-      : chatModels;
+  // "Live" alone is the default state, not a user filter worth flagging.
+  const defaultStatus = statusSel.size === 1 && statusSel.has("Live");
+  const anyFilter =
+    search.trim() !== "" ||
+    providerSel.size > 0 ||
+    publisherSel.size > 0 ||
+    redundancySel.size > 0 ||
+    !defaultStatus;
 
-  const hiddenCount = inScope.filter((m) => !m.is_usable).length;
-  const shown = showUnavailable ? inScope : inScope.filter((m) => m.is_usable);
-
-  function pickCard(name: string | null) {
-    setSelected(name);
-    setPublishers(new Set());     // cards replace the publisher axis
+  function clearFilters() {
+    setSearch("");
+    setProviderSel(new Set());
+    setPublisherSel(new Set());
+    setStatusSel(new Set(["Live"]));
+    setRedundancySel(new Set());
   }
 
-  function togglePublisher(pub: string) {
-    setSelected(null);            // publishers replace the card axis
-    setPublishers((cur) => {
+  // Cards toggle the Provider filter (and always mean chat mode).
+  function pickCard(name: string) {
+    setMode("chat");
+    setProviderSel((cur) => {
       const next = new Set(cur);
-      if (next.has(pub)) next.delete(pub);
-      else next.add(pub);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
       return next;
     });
   }
 
   const tableTitle =
-    publishers.size > 0
-      ? `${[...publishers].join(", ")} — ${shown.length} models`
-      : embSelected
-      ? `Embeddings — ${shown.length} models`
-      : active
-      ? `${active.name} — ${shown.length} models`
-      : `${shown.length} chat models`;
+    `${shown.length} ${mode === "embedding" ? "embedding" : "chat"} model${shown.length === 1 ? "" : "s"}` +
+    (anyFilter ? " (filtered)" : "");
 
   return (
-    <div className="flex gap-6">
-      {/* ── main column ── */}
-      <div className="min-w-0 flex-1 space-y-6">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-lg font-semibold text-neutral-100">My models</h1>
-            <p className="mt-1 text-sm text-neutral-500">
-              {models.length} models across {groups.length} provider
-              {groups.length === 1 ? "" : "s"} · request them by name from any OpenAI client.
-            </p>
-          </div>
-          <button
-            className="btn-sec"
-            onClick={() => reprobe.mutate()}
-            disabled={reprobe.isPending}
-          >
-            {reprobe.isPending ? "Testing…" : "Re-test all"}
-          </button>
+    <div className="min-w-0 space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-lg font-semibold text-neutral-100">My models</h1>
+          <p className="mt-1 text-sm text-neutral-500">
+            {models.length} models across {groups.length} provider
+            {groups.length === 1 ? "" : "s"} · request them by name from any OpenAI client.
+          </p>
         </div>
+        <button
+          className="btn-sec"
+          onClick={() => reprobe.mutate()}
+          disabled={reprobe.isPending}
+        >
+          {reprobe.isPending ? "Testing…" : "Re-test all"}
+        </button>
+      </div>
 
-        <ProbeProgress />
+      <ProbeProgress />
 
-        {/* Only LIVE models count here — no backup of nothing is not news. */}
-        {exposed > 0 && (
-          <div className="rounded-xl border border-amber-900/50 bg-amber-950/20 px-4 py-3 text-sm text-amber-300">
-            <strong className="font-medium">
-              {exposed} live model{exposed === 1 ? "" : "s"} with no backup.
-            </strong>{" "}
-            If that one key hits its rate limit, they go dark. Adding a second key —
-            even at the same provider — gives them somewhere to fall back to.
-          </div>
-        )}
+      {/* Only LIVE models count here — no backup of nothing is not news. */}
+      {exposed > 0 && (
+        <div className="rounded-xl border border-amber-900/50 bg-amber-950/20 px-4 py-3 text-sm text-amber-300">
+          <strong className="font-medium">
+            {exposed} live model{exposed === 1 ? "" : "s"} with no backup.
+          </strong>{" "}
+          If that one key hits its rate limit, they go dark. Adding a second key —
+          even at the same provider — gives them somewhere to fall back to.
+        </div>
+      )}
 
-        {/* ── cards: providers (chat) + embeddings ── */}
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {groups.map((g) => {
-            const isSel = selected === g.name;
-            return (
-              <button
-                key={g.name}
-                onClick={() => pickCard(isSel ? null : g.name)}
-                className={`card text-left transition-colors ${
-                  isSel ? "border-emerald-700 bg-emerald-950/20" : "hover:border-neutral-700"
-                }`}
-              >
-                <div className="flex items-center justify-between">
-                  <h2 className="font-medium text-neutral-100">{g.name}</h2>
-                  <span className={`text-xs ${isSel ? "text-emerald-400" : "text-neutral-600"}`}>
-                    {isSel ? "showing ▾" : "click to view"}
-                  </span>
-                </div>
-                <div className="mt-3 flex items-end gap-5">
-                  <div>
-                    <div className="text-2xl font-semibold tabular-nums text-neutral-100">
-                      {g.live}
-                      <span className="text-sm font-normal text-neutral-600">
-                        /{g.models.length}
-                      </span>
-                    </div>
-                    <div className="text-xs text-neutral-600">models live</div>
-                  </div>
-                  {g.exposed > 0 && (
-                    <div>
-                      <div className="text-2xl font-semibold tabular-nums text-amber-400">
-                        {g.exposed}
-                      </div>
-                      <div className="text-xs text-neutral-600">no backup</div>
-                    </div>
-                  )}
-                </div>
-              </button>
-            );
-          })}
-
-          {/* Embeddings are a different surface (/v1/embeddings), hence a
-              different-coloured card rather than rows mixed into chat counts. */}
-          {embModels.length > 0 && (
+      {/* ── cards: providers (chat) + embeddings — shortcuts into the filters ── */}
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {groups.map((g) => {
+          const isSel = mode === "chat" && providerSel.has(g.name);
+          return (
             <button
-              onClick={() => pickCard(embSelected ? null : "__embeddings__")}
+              key={g.name}
+              onClick={() => pickCard(g.name)}
               className={`card text-left transition-colors ${
-                embSelected ? "border-purple-700 bg-purple-950/20" : "hover:border-neutral-700"
+                isSel ? "border-emerald-700 bg-emerald-950/20" : "hover:border-neutral-700"
               }`}
             >
               <div className="flex items-center justify-between">
-                <h2 className="font-medium text-purple-300">Embeddings</h2>
-                <span className={`text-xs ${embSelected ? "text-purple-400" : "text-neutral-600"}`}>
-                  {embSelected ? "showing ▾" : "click to view"}
+                <h2 className="font-medium text-neutral-100">{g.name}</h2>
+                <span className={`text-xs ${isSel ? "text-emerald-400" : "text-neutral-600"}`}>
+                  {isSel ? "filtering ▾" : "click to filter"}
                 </span>
               </div>
               <div className="mt-3 flex items-end gap-5">
                 <div>
                   <div className="text-2xl font-semibold tabular-nums text-neutral-100">
-                    {embModels.filter((m) => m.is_usable).length}
+                    {g.live}
                     <span className="text-sm font-normal text-neutral-600">
-                      /{embModels.length}
+                      /{g.models.length}
                     </span>
                   </div>
                   <div className="text-xs text-neutral-600">models live</div>
                 </div>
-                <div className="pb-1 text-xs text-neutral-600">via /v1/embeddings</div>
+                {g.exposed > 0 && (
+                  <div>
+                    <div className="text-2xl font-semibold tabular-nums text-amber-400">
+                      {g.exposed}
+                    </div>
+                    <div className="text-xs text-neutral-600">no backup</div>
+                  </div>
+                )}
               </div>
             </button>
-          )}
-        </div>
+          );
+        })}
 
-        {/* ── the model table ── */}
-        <div className="card p-0">
-          <div className="flex items-center justify-between border-b border-neutral-800 px-4 py-3">
-            <h3 className="text-sm font-medium text-neutral-300">{tableTitle}</h3>
-            <div className="flex items-center gap-4">
-              {hiddenCount > 0 && (
-                <button
-                  className="text-xs text-neutral-500 hover:text-neutral-300"
-                  onClick={() => setShowUnavailable((v) => !v)}
-                  title="Unavailable = the probe couldn't get a reply (rate limits, dead keys, models not served to your account). Hidden so the usable list stays readable."
-                >
-                  {showUnavailable ? "hide unavailable" : `show ${hiddenCount} unavailable`}
-                </button>
-              )}
-              {(active || embSelected || publishers.size > 0) && (
-                <button
-                  className="text-xs text-neutral-500 hover:text-neutral-300"
-                  onClick={() => { setSelected(null); setPublishers(new Set()); }}
-                >
-                  show all ✕
-                </button>
-              )}
+        {/* Embeddings are a different surface (/v1/embeddings), hence a mode
+            switch on the table rather than rows mixed into chat counts. */}
+        {embModels.length > 0 && (
+          <button
+            onClick={() => setMode((m) => (m === "embedding" ? "chat" : "embedding"))}
+            className={`card text-left transition-colors ${
+              mode === "embedding" ? "border-purple-700 bg-purple-950/20" : "hover:border-neutral-700"
+            }`}
+          >
+            <div className="flex items-center justify-between">
+              <h2 className="font-medium text-purple-300">Embeddings</h2>
+              <span className={`text-xs ${mode === "embedding" ? "text-purple-400" : "text-neutral-600"}`}>
+                {mode === "embedding" ? "showing ▾" : "click to view"}
+              </span>
             </div>
-          </div>
-          <table className="w-full">
-            <thead>
-              <tr>
-                <th className="th">Model</th>
-                <th className="th">Publisher</th>
-                <th className="th">Providers</th>
-                <th className="th">Live keys</th>
-                <th className="th">Redundancy</th>
-                <th className="th">Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {shown.length === 0 && (
-                <tr>
-                  <td className="td text-neutral-600" colSpan={6}>
-                    No live models here — {hiddenCount} unavailable hidden.
-                  </td>
-                </tr>
-              )}
-              {shown.map((m) => (
-                <tr key={`${m.model}-${m.mode}`} className="hover:bg-neutral-900/40">
-                  <td className="td">
-                    <span className="font-mono text-neutral-100">{m.model}</span>
-                    {m.mode === "embedding" && (
-                      <span className="ml-2 rounded bg-purple-950/60 px-1.5 py-0.5 text-[10px] text-purple-400">
-                        embedding
-                      </span>
-                    )}
-                    {/* is_common is a catalog badge — NOT a promise that YOU have
-                        a fallback. Rendered dim, never as reassurance. */}
-                    {m.is_common && (
-                      <span
-                        className="ml-2 rounded bg-neutral-800 px-1.5 py-0.5 text-[10px] text-neutral-500"
-                        title="Two or more providers serve this model in the catalog. That doesn't mean you hold keys to them."
-                      >
-                        common
-                      </span>
-                    )}
-                  </td>
-                  <td className="td text-neutral-400">{m.publisher ?? "—"}</td>
-                  <td className="td text-neutral-400">{m.providers.join(", ")}</td>
-                  <td className="td tabular-nums text-neutral-400">
-                    {m.live_keys}/{m.total_keys}
-                  </td>
-                  <td className="td"><RedundancyBadge model={m} /></td>
-                  <td className="td">
-                    <span className="inline-flex items-center gap-2">
-                      <StatusDot ok={m.is_usable} />
-                      <span className={m.is_usable ? "text-neutral-300" : "text-neutral-600"}>
-                        {m.is_usable ? "Live" : "Unavailable"}
-                      </span>
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+            <div className="mt-3 flex items-end gap-5">
+              <div>
+                <div className="text-2xl font-semibold tabular-nums text-neutral-100">
+                  {embModels.filter((m) => m.is_usable).length}
+                  <span className="text-sm font-normal text-neutral-600">
+                    /{embModels.length}
+                  </span>
+                </div>
+                <div className="text-xs text-neutral-600">models live</div>
+              </div>
+              <div className="pb-1 text-xs text-neutral-600">via /v1/embeddings</div>
+            </div>
+          </button>
+        )}
       </div>
 
-      {/* ── right sidebar: publisher filter (like build.nvidia.com's) ── */}
-      <aside className="hidden w-56 shrink-0 lg:block">
-        <div className="card sticky top-6">
-          <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-sm font-medium text-neutral-200">Publisher</h2>
-            {publishers.size > 0 && (
-              <button
-                className="text-xs text-neutral-500 hover:text-neutral-300"
-                onClick={() => setPublishers(new Set())}
-              >
-                Reset
-              </button>
-            )}
-          </div>
-          <ul className="max-h-[70vh] space-y-1 overflow-y-auto pr-1">
-            {publisherCounts.map(([pub, count]) => {
-              const checked = publishers.has(pub);
-              return (
-                <li key={pub}>
-                  <label
-                    className={`flex cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm
-                                transition-colors hover:bg-neutral-800/60 ${
-                                  checked ? "text-neutral-100" : "text-neutral-400"
-                                }`}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      onChange={() => togglePublisher(pub)}
-                      className="h-4 w-4 rounded accent-emerald-600"
-                    />
-                    <span className="flex-1 truncate">{pub}</span>
-                    <span className="tabular-nums text-xs text-neutral-600">{count}</span>
-                  </label>
-                </li>
-              );
-            })}
-          </ul>
+      {/* ── filter bar: everything combines ── */}
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          type="search"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search models…"
+          className="w-56 rounded-lg border border-neutral-800 bg-neutral-900 px-3 py-1.5 text-sm
+                     text-neutral-200 outline-none placeholder:text-neutral-600
+                     focus:border-neutral-600"
+        />
+        <FilterDropdown
+          label="Provider" options={providerOptions}
+          selected={providerSel} onChange={setProviderSel}
+        />
+        <FilterDropdown
+          label="Publisher" options={publisherOptions}
+          selected={publisherSel} onChange={setPublisherSel}
+        />
+        <FilterDropdown
+          label="Status" options={statusOptions}
+          selected={statusSel} onChange={setStatusSel}
+        />
+        <FilterDropdown
+          label="Redundancy" options={redundancyOptions}
+          selected={redundancySel} onChange={setRedundancySel}
+        />
+        {anyFilter && (
+          <button
+            className="text-xs text-neutral-500 hover:text-neutral-300"
+            onClick={clearFilters}
+          >
+            clear filters ✕
+          </button>
+        )}
+      </div>
+
+      {/* ── the model table ── */}
+      <div className="card p-0">
+        <div className="border-b border-neutral-800 px-4 py-3">
+          <h3 className="text-sm font-medium text-neutral-300">{tableTitle}</h3>
         </div>
-      </aside>
+        <table className="w-full">
+          <thead>
+            <tr>
+              <th className="th">Model</th>
+              <th className="th">Publisher</th>
+              <th className="th">Providers</th>
+              <th className="th">Live keys</th>
+              <th className="th">Redundancy</th>
+              <th className="th">Status</th>
+              <th className="th"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {shown.length === 0 && (
+              <tr>
+                <td className="td text-neutral-600" colSpan={7}>
+                  No models match these filters —{" "}
+                  <button className="underline hover:text-neutral-300" onClick={clearFilters}>
+                    clear filters
+                  </button>
+                  .
+                </td>
+              </tr>
+            )}
+            {shown.map((m) => (
+              <tr key={`${m.model}-${m.mode}`} className="hover:bg-neutral-900/40">
+                <td className="td">
+                  <span className="font-mono text-neutral-100">{m.model}</span>
+                  {m.mode === "embedding" && (
+                    <span className="ml-2 rounded bg-purple-950/60 px-1.5 py-0.5 text-[10px] text-purple-400">
+                      embedding
+                    </span>
+                  )}
+                  {/* is_common is a catalog badge — NOT a promise that YOU have
+                      a fallback. Rendered dim, never as reassurance. */}
+                  {m.is_common && (
+                    <span
+                      className="ml-2 rounded bg-neutral-800 px-1.5 py-0.5 text-[10px] text-neutral-500"
+                      title="Two or more providers serve this model in the catalog. That doesn't mean you hold keys to them."
+                    >
+                      common
+                    </span>
+                  )}
+                </td>
+                <td className="td text-neutral-400">{m.publisher ?? "—"}</td>
+                <td className="td text-neutral-400">{m.providers.join(", ")}</td>
+                <td className="td tabular-nums text-neutral-400">
+                  {m.live_keys}/{m.total_keys}
+                </td>
+                <td className="td"><RedundancyBadge model={m} /></td>
+                <td className="td">
+                  <span className="inline-flex items-center gap-2">
+                    <StatusDot ok={m.is_usable} />
+                    <span className={m.is_usable ? "text-neutral-300" : "text-neutral-600"}>
+                      {m.is_usable ? "Live" : "Unavailable"}
+                    </span>
+                  </span>
+                </td>
+                <td className="td text-right">
+                  {/* Embedding models can't chat, and a dead model can't answer —
+                      only live chat rows get the shortcut. */}
+                  {m.mode !== "embedding" && m.is_usable && (
+                    <Link
+                      to={`/playground?model=${encodeURIComponent(m.model)}`}
+                      className="rounded-lg border border-neutral-800 px-2.5 py-1 text-xs
+                                 text-neutral-400 transition-colors hover:border-emerald-700
+                                 hover:text-emerald-300"
+                      title="Open the Playground with this model selected"
+                    >
+                      Try ↗
+                    </Link>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

@@ -16,7 +16,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 
 import { api, ApiError } from "../lib/api";
 import { Empty, Spinner } from "../components/ui";
@@ -37,6 +37,10 @@ const STARTERS = [
 export default function Playground() {
   const models = useQuery({ queryKey: ["my-models"], queryFn: api.myModels });
 
+  // "Try" links on the Models page arrive as /playground?model=<name>.
+  const [params] = useSearchParams();
+  const requested = params.get("model") ?? "";
+
   const [model, setModel] = useState("");
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Msg[]>([]);
@@ -51,10 +55,13 @@ export default function Playground() {
     (m) => m.is_usable && m.mode !== "embedding",
   );
 
-  // Default to the first usable model once they load.
+  // Default once models load: the ?model= from a "Try" link if it's actually
+  // usable, otherwise the first usable model.
   useEffect(() => {
-    if (!model && usable.length > 0) setModel(usable[0].model);
-  }, [model, usable]);
+    if (model || usable.length === 0) return;
+    const match = requested && usable.find((m) => m.model === requested);
+    setModel(match ? match.model : usable[0].model);
+  }, [model, usable, requested]);
 
   // Keep the newest tokens in view while a response streams in.
   useEffect(() => {
