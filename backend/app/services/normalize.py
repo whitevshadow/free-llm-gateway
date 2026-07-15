@@ -135,10 +135,13 @@ _PUBLISHER_ALIASES = {
     "xai": "xAI", "x-ai": "xAI",
 }
 
-# Groq's un-prefixed ids, attributed by name. Order matters: first match wins.
+# Un-prefixed ids (Groq, Google AI Studio), attributed by name. Order matters:
+# first match wins.
 _BARE_PREFIX_RULES = [
     ("whisper", "OpenAI"),
     ("gpt", "OpenAI"),
+    ("gemini", "Google"),
+    ("imagen", "Google"),
     ("llama", "Meta"),
     ("gemma", "Google"),
     ("qwen", "Qwen"),

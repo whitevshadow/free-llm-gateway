@@ -27,7 +27,7 @@ from app.models.enums import ModelMode
 from app.models.provider import Provider
 from app.models.provider_key import ProviderKey
 from app.models.provider_model import ProviderModel
-from app.services import crypto, presets
+from app.services import crypto, nvcf, presets
 from app.services.normalize import normalize_model_name, publisher_for
 
 logger = logging.getLogger("gateway.catalog")
@@ -41,10 +41,14 @@ _CHAT_JUNK = ("-ocr", "ocrnet", "guard")
 # Name tokens that identify image-GENERATION models (served via
 # /v1/images/generations). Deliberately conservative: vision-capable CHAT
 # models (gpt-4o, llama-4 scout) must stay mode='chat' — they answer
-# /chat/completions, images go IN, not out.
+# /chat/completions, images go IN, not out. "-image" catches the newer
+# suffix convention (gpt-5-image, gemini-3-pro-image-preview) without
+# touching "vision" models. Audio-NATIVE chat models (gpt-audio,
+# gemini native-audio) also stay chat: they serve /chat/completions with
+# audio in the messages, not /v1/audio/*.
 _IMAGE_TOKENS = (
     "dall-e", "gpt-image", "flux", "stable-diffusion", "sdxl",
-    "sd3", "imagen", "-img2img", "-text2img",
+    "sd3", "imagen", "-img2img", "-text2img", "-image",
 )
 
 # Audio models: speech-to-text (whisper/…-transcribe) and text-to-speech
@@ -190,14 +194,17 @@ def discover_provider(
             continue
 
         seen.add(mid)
-        litellm_model = f"{provider.slug}/{mid}"   # slug doubles as the litellm prefix
+        # Gemini lists ids as 'models/gemini-2.5-flash'; litellm wants the bare
+        # id after the provider prefix — 'gemini/models/…' 404s on every call.
+        call_id = mid[len("models/"):] if mid.startswith("models/") else mid
+        litellm_model = f"{provider.slug}/{call_id}"   # slug doubles as the litellm prefix
         normalized = normalize_model_name(litellm_model)
 
         row = existing.get(mid)
         if row:
             row.litellm_model = litellm_model
             row.normalized_name = normalized
-            row.publisher = publisher_for(mid)
+            row.publisher = publisher_for(call_id)
             row.mode = mode
             row.enabled = True
             updated += 1
@@ -208,11 +215,40 @@ def discover_provider(
                     upstream_model_id=mid,
                     litellm_model=litellm_model,
                     normalized_name=normalized,
-                    publisher=publisher_for(mid),
+                    publisher=publisher_for(call_id),
                     mode=mode,
                 )
             )
             added += 1
+
+    # NVIDIA's image models are NOT on the OpenAI-compatible list — they are
+    # NVCF cloud functions on a separate surface with their own protocol (see
+    # services/nvcf.py). Discovery folds the ones the adapter can serve into
+    # the same catalog, marked litellm_model='nvcf/<id>' so the prober and the
+    # images endpoint know to bypass litellm for them.
+    if provider.slug == "nvidia_nim":
+        for name, fid in nvcf.list_image_functions(api_key):
+            seen.add(name)
+            row = existing.get(name)
+            if row:
+                row.litellm_model = f"{nvcf.MODEL_PREFIX}{fid}"
+                row.normalized_name = name.lower()
+                row.publisher = "Black Forest Labs"
+                row.mode = ModelMode.image
+                row.enabled = True
+                updated += 1
+            else:
+                db.add(
+                    ProviderModel(
+                        provider_id=provider.id,
+                        upstream_model_id=name,
+                        litellm_model=f"{nvcf.MODEL_PREFIX}{fid}",
+                        normalized_name=name.lower(),
+                        publisher="Black Forest Labs",
+                        mode=ModelMode.image,
+                    )
+                )
+                added += 1
 
     disabled = 0
     for mid, row in existing.items():

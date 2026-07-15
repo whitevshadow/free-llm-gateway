@@ -38,7 +38,7 @@ from app.models.enums import ModelHealth, ModelMode
 from app.models.provider import Provider
 from app.models.provider_key import ProviderKey
 from app.models.provider_model import ProviderModel
-from app.services import crypto, presets
+from app.services import crypto, nvcf, presets
 from app.services.catalog import audio_kind
 
 logger = logging.getLogger("gateway.prober")
@@ -151,7 +151,11 @@ def _classify(exc: Exception) -> Tuple[ModelHealth, Optional[int], str]:
     """Map a litellm exception onto our health enum. These distinctions matter."""
     name = type(exc).__name__
     msg = str(exc)
+    # litellm exceptions carry status_code directly; httpx errors (raised by
+    # the NVCF adapter) carry it on .response. Same enum either way.
     code = getattr(exc, "status_code", None)
+    if code is None:
+        code = getattr(getattr(exc, "response", None), "status_code", None)
 
     if isinstance(exc, litellm.RateLimitError) or code == 429:
         return ModelHealth.rate_limited, 429, msg     # key WORKS, just throttled
@@ -214,7 +218,11 @@ async def _probe_one(
     """
     started = datetime.now(timezone.utc)
     try:
-        if mode is ModelMode.embedding:
+        if nvcf.is_nvcf_model(litellm_model):
+            # NVIDIA cloud function — litellm cannot speak this surface at all;
+            # the adapter runs the cheapest real generation instead.
+            await nvcf.probe_image(litellm_model, api_key)
+        elif mode is ModelMode.embedding:
             kwargs: Dict = {}
             # NVIDIA's retrieval models are asymmetric and REQUIRE input_type;
             # without it the probe 400s and a healthy model looks broken.
@@ -272,15 +280,32 @@ async def _probe_one(
                 "error": msg[:500], "retry_after": retry_after_seconds(exc)}
 
 
+# Deployments with a probe currently queued or in flight. Re-testing a
+# deployment that is ALREADY being tested buys no new information and burns
+# free-tier quota — clicking "Re-test all" twice must cost nothing extra.
+# One asyncio loop, so a plain set is safe (no await between check and add).
+_inflight: set = set()
+
+
 async def probe_deployments(deployment_ids: List[int]) -> Dict:
     """
     Probe the given deployments, at most MAX_CONCURRENCY at a time, writing the
     results back. Opens its own session — this runs detached from the request that
     queued it.
-    """
-    if not deployment_ids:
-        return {"probed": 0}
 
+    Deployments already in an active probe run are SKIPPED, not re-queued: the
+    in-flight probe will write their result momentarily, and a duplicate request
+    would only waste the key's quota and inflate the progress bar.
+    """
+    requested = len(deployment_ids)
+    deployment_ids = [i for i in deployment_ids if i not in _inflight]
+    skipped = requested - len(deployment_ids)
+    if skipped:
+        logger.info("Skipped %d deployment(s) already being probed.", skipped)
+    if not deployment_ids:
+        return {"probed": 0, "skipped_inflight": skipped}
+
+    _inflight.update(deployment_ids)
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
     db: Session = SessionLocal()
 
@@ -359,8 +384,9 @@ async def probe_deployments(deployment_ids: List[int]) -> Dict:
 
         db.commit()
         logger.info("Probed %d deployment(s): %s", len(rows), counts)
-        return {"probed": len(rows), **counts}
+        return {"probed": len(rows), "skipped_inflight": skipped, **counts}
     finally:
+        _inflight.difference_update(deployment_ids)
         db.close()
 
 

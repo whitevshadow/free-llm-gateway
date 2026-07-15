@@ -7,11 +7,11 @@
  * something has gone wrong.
  */
 
-import { useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api, ApiError } from "../lib/api";
-import type { AddProviderResult, MintedKey, ProviderInfo } from "../lib/types";
+import type { AddProviderResult, AdminModel, MintedKey, ProviderInfo } from "../lib/types";
 import { Spinner } from "../components/ui";
 
 export default function Admin() {
@@ -20,6 +20,8 @@ export default function Admin() {
   const [addingProvider, setAddingProvider] = useState(false);
   const [creatingUser, setCreatingUser] = useState(false);
   const [deleting, setDeleting] = useState<ProviderInfo | null>(null);
+  // Which provider's model catalog is expanded inline (one at a time).
+  const [expanded, setExpanded] = useState<string | null>(null);
 
   const providers = useQuery({ queryKey: ["admin-providers"], queryFn: api.admin.providers });
   const users = useQuery({ queryKey: ["admin-users"], queryFn: api.admin.users });
@@ -81,11 +83,25 @@ export default function Admin() {
           </thead>
           <tbody>
             {providers.data!.providers.map((p) => (
-              <tr key={p.id} className={p.enabled === false ? "opacity-50" : ""}>
+              <Fragment key={p.id}>
+              <tr className={p.enabled === false ? "opacity-50" : ""}>
                 <td className="td font-mono text-neutral-300">{p.slug}</td>
                 <td className="td text-neutral-300">{p.name}</td>
                 <td className="td text-xs text-neutral-600">{p.base_url ?? "(default)"}</td>
-                <td className="td text-right tabular-nums">{p.model_count ?? 0}</td>
+                <td className="td text-right tabular-nums">
+                  {/* The count opens the full catalog inline — every model,
+                      each with its own enable toggle. */}
+                  <button
+                    className="rounded px-1.5 py-0.5 text-neutral-300 underline decoration-neutral-700
+                               underline-offset-2 hover:text-emerald-300 disabled:no-underline
+                               disabled:text-neutral-600"
+                    disabled={(p.model_count ?? 0) === 0}
+                    onClick={() => setExpanded((cur) => (cur === p.slug ? null : p.slug))}
+                    title="Show every model in this provider's catalog"
+                  >
+                    {p.model_count ?? 0} {expanded === p.slug ? "▾" : "▸"}
+                  </button>
+                </td>
                 <td className="td">
                   {/* Disable = reversible pause: nothing is deleted, but the
                       provider leaves every user's routing set (enforced in the
@@ -135,6 +151,14 @@ export default function Admin() {
                   </div>
                 </td>
               </tr>
+              {expanded === p.slug && (
+                <tr>
+                  <td colSpan={6} className="bg-neutral-950/60 px-4 pb-4 pt-2">
+                    <ProviderModels slug={p.slug} />
+                  </td>
+                </tr>
+              )}
+              </Fragment>
             ))}
           </tbody>
         </table>
@@ -200,7 +224,6 @@ export default function Admin() {
 
       {addingProvider && (
         <AddProviderDialog
-          onClose={() => setAddingProvider(false)}
           onSaved={() => {
             setAddingProvider(false);
             qc.invalidateQueries({ queryKey: ["admin-providers"] });
@@ -225,6 +248,139 @@ export default function Admin() {
           onConfirm={() => remove.mutate(deleting.slug)}
         />
       )}
+    </div>
+  );
+}
+
+const MODE_BADGE: Record<string, string> = {
+  chat: "bg-emerald-950/60 text-emerald-400",
+  embedding: "bg-purple-950/60 text-purple-400",
+  image: "bg-sky-950/60 text-sky-400",
+  audio: "bg-rose-950/60 text-rose-400",
+};
+
+/**
+ * The full catalog of ONE provider, expanded inline under its row — every
+ * model, enabled or not, each with its own toggle. Disabling a model here is
+ * cross-user (it leaves everyone's routing set), which is why this lives on
+ * the Admin page and not on My models.
+ */
+function ProviderModels({ slug }: { slug: string }) {
+  const qc = useQueryClient();
+  const [q, setQ] = useState("");
+
+  const models = useQuery({
+    queryKey: ["admin-models", slug],
+    queryFn: () => api.admin.providerModels(slug),
+  });
+
+  const toggle = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      api.admin.toggleModel(id, enabled),
+    // Patch the cached row instead of refetching a 300-model list per click.
+    onSuccess: (r) => {
+      qc.setQueryData(
+        ["admin-models", slug],
+        (cur: { provider: string; models: AdminModel[] } | undefined) =>
+          cur && {
+            ...cur,
+            models: cur.models.map((m) =>
+              m.id === r.id ? { ...m, enabled: r.enabled } : m,
+            ),
+          },
+      );
+    },
+  });
+
+  const rows = models.data?.models ?? [];
+  const shown = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    if (!needle) return rows;
+    return rows.filter(
+      (m) =>
+        m.model.toLowerCase().includes(needle) ||
+        (m.publisher ?? "").toLowerCase().includes(needle) ||
+        m.mode.includes(needle),
+    );
+  }, [rows, q]);
+
+  if (models.isLoading) return <Spinner />;
+
+  const disabled = rows.filter((m) => !m.enabled).length;
+
+  return (
+    <div className="rounded-lg border border-neutral-800">
+      <div className="flex flex-wrap items-center gap-3 border-b border-neutral-800 px-3 py-2">
+        <span className="text-xs text-neutral-400">
+          {rows.length} model{rows.length === 1 ? "" : "s"}
+          {disabled > 0 && (
+            <span className="text-neutral-600"> · {disabled} disabled</span>
+          )}
+        </span>
+        <input
+          type="search"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Filter models…"
+          className="ml-auto w-48 rounded-lg border border-neutral-800 bg-neutral-900 px-2.5 py-1
+                     text-xs text-neutral-200 outline-none placeholder:text-neutral-600
+                     focus:border-neutral-600"
+        />
+      </div>
+      <div className="max-h-96 overflow-y-auto">
+        <table className="w-full">
+          <tbody>
+            {shown.length === 0 && (
+              <tr>
+                <td className="td text-xs text-neutral-600">No models match.</td>
+              </tr>
+            )}
+            {shown.map((m) => (
+              <tr
+                key={m.id}
+                className={`border-b border-neutral-900 last:border-0 hover:bg-neutral-900/40 ${
+                  m.enabled ? "" : "opacity-50"
+                }`}
+              >
+                <td className="px-3 py-1.5">
+                  <span className="font-mono text-xs text-neutral-200">{m.model}</span>
+                  <span
+                    className={`ml-2 rounded px-1.5 py-0.5 text-[10px] ${
+                      MODE_BADGE[m.mode] ?? "bg-neutral-800 text-neutral-400"
+                    }`}
+                  >
+                    {m.mode}
+                  </span>
+                </td>
+                <td className="px-3 py-1.5 text-xs text-neutral-500">
+                  {m.publisher ?? "—"}
+                </td>
+                <td className="px-3 py-1.5 text-right">
+                  <button
+                    role="switch"
+                    aria-checked={m.enabled}
+                    onClick={() => toggle.mutate({ id: m.id, enabled: !m.enabled })}
+                    disabled={toggle.isPending}
+                    title={
+                      m.enabled
+                        ? "Enabled. Click to disable — it drops out of every user's routing until re-enabled."
+                        : "Disabled: hidden from routing for everyone. Click to re-enable."
+                    }
+                    className={`relative h-4 w-8 rounded-full transition-colors ${
+                      m.enabled ? "bg-emerald-600" : "bg-neutral-700"
+                    }`}
+                  >
+                    <span
+                      className="absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all"
+                      style={{ left: m.enabled ? "1.125rem" : "0.125rem" }}
+                    />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -340,113 +496,145 @@ function MintedKeyDialog({ k, onClose }: { k: MintedKey; onClose: () => void }) 
   );
 }
 
-const CUSTOM = "__custom__";
-
 /**
- * Register a provider — a DESTINATION only. No API key is asked for here.
+ * Register providers — DESTINATIONS only. No API key is asked for here.
  *
- *   PRESET  → pick from the dropdown; base_url + LiteLLM prefix come with it.
- *   CUSTOM  → supply slug, name and base_url yourself.
+ * ONE FLAT LIST, ONE TOGGLE PER PROVIDER — no dropdown. Toggling ON registers
+ * the preset (or re-enables it if it was disabled); toggling OFF disables it
+ * without deleting anything. A custom OpenAI-compatible endpoint has its own
+ * small form below the list.
  *
  * Keys live on the Providers & keys page, for admins and users alike. Model
  * auto-discovery still happens — it fires when the FIRST key for this provider
  * is added there, because that key is what discovery calls /v1/models with.
  */
-function AddProviderDialog({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
+function AddProviderDialog({ onSaved }: { onSaved: () => void }) {
+  const qc = useQueryClient();
   const presets = useQuery({ queryKey: ["presets"], queryFn: api.admin.presets });
+  const providers = useQuery({ queryKey: ["admin-providers"], queryFn: api.admin.providers });
 
-  const [choice, setChoice] = useState<string>("");
+  const [showCustom, setShowCustom] = useState(false);
   const [slug, setSlug] = useState("");
   const [name, setName] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<AddProviderResult | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);   // slug mid-flight
 
-  const isCustom = choice === CUSTOM;
-  const preset = presets.data?.presets.find((p) => p.slug === choice);
+  const registered = new Map(
+    (providers.data?.providers ?? []).map((p) => [p.slug, p]),
+  );
 
-  const save = useMutation({
+  async function toggleRow(presetSlug: string) {
+    setBusy(presetSlug);
+    setError(null);
+    try {
+      const existing = registered.get(presetSlug);
+      if (!existing) {
+        await api.admin.addProvider({ slug: presetSlug });
+      } else {
+        await api.admin.toggleProvider(presetSlug, existing.enabled === false);
+      }
+      await qc.invalidateQueries({ queryKey: ["admin-providers"] });
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+    }
+    setBusy(null);
+  }
+
+  const saveCustom = useMutation({
     mutationFn: () =>
-      api.admin.addProvider(
-        isCustom
-          ? {
-              slug: slug.trim().toLowerCase(),
-              name: name.trim(),
-              base_url: baseUrl.trim(),
-            }
-          : { slug: choice },
-      ),
-    onSuccess: (r) => {
+      api.admin.addProvider({
+        slug: slug.trim().toLowerCase(),
+        name: name.trim(),
+        base_url: baseUrl.trim(),
+      }),
+    onSuccess: (_r: AddProviderResult) => {
       setError(null);
-      setResult(r);
-      setTimeout(onSaved, 2200);
+      setShowCustom(false);
+      setSlug(""); setName(""); setBaseUrl("");
+      qc.invalidateQueries({ queryKey: ["admin-providers"] });
     },
     onError: (e: ApiError) => setError(e.message),
   });
 
-  const ready = isCustom
-    ? slug.trim() && name.trim() && baseUrl.trim()
-    : choice && choice !== "";
-
-  // ── registered: point at the next step, which is where the key goes ──
-  if (result) {
-    return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-        <div className="card w-full max-w-md border-emerald-900/60">
-          <h2 className="font-medium text-neutral-100">{result.name} registered</h2>
-          <p className="mt-2 text-sm text-neutral-400">{result.detail}</p>
-          <button className="btn-sec mt-4 w-full" onClick={onSaved}>Close</button>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="card w-full max-w-md">
-        <h2 className="mb-1 font-medium text-neutral-100">Add a provider</h2>
-        <p className="mb-4 text-xs text-neutral-600">
-          Registers the destination. API keys are added afterwards under
+      <div className="card flex max-h-[85vh] w-full max-w-lg flex-col">
+        <h2 className="mb-1 font-medium text-neutral-100">Providers</h2>
+        <p className="mb-3 text-xs text-neutral-600">
+          Toggle a provider on to register it. API keys are added afterwards under
           Providers &amp; keys — the first key auto-discovers its models.
         </p>
 
-        <label className="label">Provider</label>
-        <select
-          className="input mb-4"
-          value={choice}
-          onChange={(e) => {
-            setChoice(e.target.value);
-            setError(null);
-          }}
-        >
-          <option value="" disabled>Choose a provider…</option>
-          {presets.data?.presets.map((p) => (
-            <option key={p.slug} value={p.slug}>{p.name}</option>
-          ))}
-          <option value={CUSTOM}>Custom (OpenAI-compatible endpoint)…</option>
-        </select>
-
-        {/* PRESET: the endpoint is known, so the admin only pastes a key. */}
-        {preset && (
-          <div className="mb-4 rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2.5">
-            <div className="font-mono text-xs text-neutral-400">{preset.base_url}</div>
-            <div className="mt-1 text-xs text-neutral-600">{preset.hint}</div>
-            {preset.docs_url && (
-              <a
-                href={preset.docs_url}
-                target="_blank"
-                rel="noreferrer"
-                className="mt-1 inline-block text-xs text-emerald-500 hover:underline"
+        <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-neutral-800">
+          {presets.isLoading && <Spinner />}
+          {presets.data?.presets.map((p) => {
+            const existing = registered.get(p.slug);
+            const on = !!existing && existing.enabled !== false;
+            return (
+              <div
+                key={p.slug}
+                className="flex items-center gap-3 border-b border-neutral-900 px-3 py-2.5 last:border-0"
               >
-                Get an API key →
-              </a>
-            )}
-          </div>
-        )}
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm text-neutral-200">
+                    {p.name}
+                    {existing && existing.enabled === false && (
+                      <span className="ml-2 rounded bg-neutral-800 px-1.5 py-0.5 text-[10px] text-neutral-500">
+                        disabled
+                      </span>
+                    )}
+                  </div>
+                  <div className="truncate font-mono text-[11px] text-neutral-600">
+                    {p.base_url}
+                  </div>
+                </div>
+                {p.docs_url && (
+                  <a
+                    href={p.docs_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="shrink-0 text-xs text-emerald-600 hover:underline"
+                    title={p.hint ?? "Where to get an API key"}
+                  >
+                    key →
+                  </a>
+                )}
+                <button
+                  role="switch"
+                  aria-checked={on}
+                  onClick={() => toggleRow(p.slug)}
+                  disabled={busy !== null}
+                  title={
+                    on
+                      ? "Registered. Click to disable — nothing is deleted."
+                      : existing
+                        ? "Disabled. Click to re-enable."
+                        : "Not registered. Click to add it to the catalog."
+                  }
+                  className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
+                    on ? "bg-emerald-600" : "bg-neutral-700"
+                  } ${busy === p.slug ? "animate-pulse" : ""}`}
+                >
+                  <span
+                    className="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all"
+                    style={{ left: on ? "1.125rem" : "0.125rem" }}
+                  />
+                </button>
+              </div>
+            );
+          })}
+        </div>
 
         {/* CUSTOM: we have nowhere to get the endpoint from, so ask for everything. */}
-        {isCustom && (
-          <>
+        <button
+          className="mt-3 self-start text-xs text-neutral-400 hover:text-neutral-200"
+          onClick={() => setShowCustom((v) => !v)}
+        >
+          {showCustom ? "▾" : "▸"} Custom (OpenAI-compatible endpoint)…
+        </button>
+        {showCustom && (
+          <div className="mt-2 rounded-lg border border-neutral-800 p-3">
             <label className="label">Slug</label>
             <input
               className="input mb-1 font-mono"
@@ -454,13 +642,13 @@ function AddProviderDialog({ onClose, onSaved }: { onClose: () => void; onSaved:
               value={slug}
               onChange={(e) => setSlug(e.target.value)}
             />
-            <p className="mb-4 text-xs text-neutral-600">
+            <p className="mb-3 text-xs text-neutral-600">
               Also the LiteLLM prefix — <code>my-llm/some-model</code>.
             </p>
 
             <label className="label">Display name</label>
             <input
-              className="input mb-4"
+              className="input mb-3"
               placeholder="My LLM"
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -473,28 +661,28 @@ function AddProviderDialog({ onClose, onSaved }: { onClose: () => void; onSaved:
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
             />
-            <p className="mb-4 text-xs text-neutral-600">
+            <p className="mb-3 text-xs text-neutral-600">
               Must be OpenAI-compatible — we call <code>{"{base_url}"}/models</code> to
               discover what it serves.
             </p>
-          </>
+            <button
+              className="btn-pri w-full"
+              disabled={!(slug.trim() && name.trim() && baseUrl.trim()) || saveCustom.isPending}
+              onClick={() => saveCustom.mutate()}
+            >
+              {saveCustom.isPending ? "Adding…" : "Add custom provider"}
+            </button>
+          </div>
         )}
 
         {error && (
-          <p className="mb-3 rounded-lg border border-red-900/60 bg-red-950/30 px-3 py-2 text-sm text-red-400">
+          <p className="mt-3 rounded-lg border border-red-900/60 bg-red-950/30 px-3 py-2 text-sm text-red-400">
             {error}
           </p>
         )}
 
-        <div className="flex justify-end gap-2">
-          <button className="btn-sec" onClick={onClose}>Cancel</button>
-          <button
-            className="btn-pri"
-            disabled={!ready || save.isPending}
-            onClick={() => save.mutate()}
-          >
-            {save.isPending ? "Adding…" : "Add provider"}
-          </button>
+        <div className="mt-4 flex justify-end">
+          <button className="btn-sec" onClick={onSaved}>Done</button>
         </div>
       </div>
     </div>

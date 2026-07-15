@@ -63,7 +63,12 @@ PRESETS: List[Dict[str, Optional[str]]] = [
     {
         "slug": "gemini",
         "name": "Google AI Studio (Gemini)",
+        # Same trap as Cohere: this OpenAI-compat URL exists for DISCOVERY
+        # ({base}/models lists the catalog). litellm's `gemini/` prefix is a
+        # NATIVE integration that treats api_base as the literal endpoint —
+        # sending this URL 404s every call, so native_routing omits it.
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "native_routing": True,
         "docs_url": "https://aistudio.google.com/apikey",
         "hint": "Free tier. Gemini 2.5/3 Flash, Gemma.",
     },

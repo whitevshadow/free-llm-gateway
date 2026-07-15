@@ -42,6 +42,15 @@ export interface MyProviderKey {
  *   has_backup_key       2+ live deployments. Two keys at the SAME provider counts.
  *   has_backup_provider  2+ live providers. Survives a whole provider outage.
  */
+/** One catalog model row in the ADMIN curation view — disabled rows included. */
+export interface AdminModel {
+  id: number;
+  model: string;                 // upstream id, e.g. 'whisper-large-v3'
+  mode: string;                  // 'chat' | 'embedding' | 'image' | 'audio'
+  publisher: string | null;
+  enabled: boolean;
+}
+
 export interface MyModel {
   model: string;
   /** 'chat' | 'embedding' | 'image' | 'audio' — each is its own /v1 surface. */

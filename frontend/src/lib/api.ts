@@ -10,8 +10,8 @@
  */
 
 import type {
-  AddProviderResult, AdminUser, LogRow, Me, MintedKey, MyModel, MyProviderKey,
-  Preset, ProviderInfo, RouterConfig, Usage,
+  AddProviderResult, AdminModel, AdminUser, LogRow, Me, MintedKey, MyModel,
+  MyProviderKey, Preset, ProviderInfo, RouterConfig, Usage,
 } from "./types";
 
 const KEY_STORAGE = "gateway_key";
@@ -88,6 +88,12 @@ export const api = {
     }),
   deleteProviderKey: (id: number) =>
     request<void>(`/v1/me/provider-keys/${id}`, { method: "DELETE" }),
+  // The narrowest probe: ONE key, its deployments only. No catalog refresh.
+  reprobeKey: (id: number) =>
+    request<{ status: string; key_id: number; detail: string }>(
+      `/v1/me/provider-keys/${id}/probe`,
+      { method: "POST" },
+    ),
   /**
    * Download my provider keys — decrypted — as a CSV backup. Not request<T>:
    * the response is a file, not JSON, and we hand it straight to the browser's
@@ -115,6 +121,31 @@ export const api = {
     a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+  },
+  /**
+   * Restore keys from a backup CSV (the exact file exportProviderKeys makes).
+   * Multipart, not request<T>: the browser sets the boundary Content-Type, and
+   * we must not send the default application/json header.
+   */
+  importProviderKeys: async (
+    file: File,
+  ): Promise<{ status: string; imported: number; skipped: string[]; detail: string }> => {
+    const token = getKey();
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch("/v1/me/provider-keys/import", {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        detail = (await res.json()).detail ?? detail;
+      } catch { /* non-JSON */ }
+      throw new ApiError(res.status, String(detail));
+    }
+    return res.json();
   },
 
   // ── my models ──
@@ -248,6 +279,16 @@ export const api = {
       request<{ added?: number; updated?: number; error?: string }>(
         `/v1/admin/providers/${slug}/discover`,
         { method: "POST" },
+      ),
+    // The admin curation view: EVERY catalog model, disabled ones included.
+    providerModels: (slug: string) =>
+      request<{ provider: string; models: AdminModel[] }>(
+        `/v1/admin/providers/${slug}/models`,
+      ),
+    toggleModel: (id: number, enabled: boolean) =>
+      request<{ id: number; model: string; enabled: boolean }>(
+        `/v1/admin/models/${id}`,
+        { method: "PATCH", body: JSON.stringify({ enabled }) },
       ),
     deleteProvider: (slug: string) =>
       request<{ status: string; models_removed: number; provider_keys_removed: number }>(

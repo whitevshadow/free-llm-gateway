@@ -29,12 +29,17 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core import llm_router as router_svc
 from app.api.gateway_auth import current_user
+from app.models.provider_key import ProviderKey
 from app.models.user import User
+from app.models.views import v_live_deployments
+from app.services import crypto
+from app.services import nvcf as nvcf_svc
 from app.services.normalize import resolve_requested_model
 from app.services.usage_logger import log_v1_usage
 
@@ -250,8 +255,45 @@ async def image_generations(
     requested = body.get("model")
     body["model"] = _resolve_or_404(user, db, requested)
 
-    lr = router_svc.get_router(user.id, db)
     start = time.perf_counter()
+
+    # NVIDIA's image models are NVCF cloud functions — a surface litellm cannot
+    # speak (see services/nvcf.py). Their deployments carry litellm_model
+    # 'nvcf/<id>', so route them through the adapter with the caller's own key.
+    nvcf_dep = db.execute(
+        select(v_live_deployments).where(
+            v_live_deployments.c.user_id == user.id,
+            v_live_deployments.c.model == body["model"],
+            v_live_deployments.c.litellm_model.like("nvcf/%"),
+        )
+    ).mappings().first()
+    if nvcf_dep:
+        pk = db.query(ProviderKey).filter(
+            ProviderKey.id == nvcf_dep["provider_key_id"]
+        ).first()
+        try:
+            result = await nvcf_svc.generate_image(
+                nvcf_dep["litellm_model"], crypto.decrypt(pk.key_ciphertext),
+                body["prompt"], size=body.get("size"), steps=body.get("steps"),
+            )
+        except Exception as exc:
+            router_svc.record_failure(nvcf_dep["deployment_id"], exc)
+            log_v1_usage(
+                user_id=user.id, requested_model=requested,
+                latency=round(time.perf_counter() - start, 3),
+                status_code=502, error_message=str(exc),
+            )
+            logger.warning("nvcf image generation failed (user %s): %s", user.id, exc)
+            raise HTTPException(status_code=502, detail=str(exc))
+        router_svc.record_success(nvcf_dep["deployment_id"])
+        log_v1_usage(
+            user_id=user.id, requested_model=requested,
+            answered_deploy_id=nvcf_dep["deployment_id"],
+            latency=round(time.perf_counter() - start, 3), status_code=200,
+        )
+        return {"created": int(time.time()), **result}
+
+    lr = router_svc.get_router(user.id, db)
     try:
         response = await lr.aimage_generation(**body)
     except Exception as exc:

@@ -21,9 +21,11 @@ import csv
 import io
 import logging
 from datetime import date
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
+from fastapi import (
+    APIRouter, BackgroundTasks, Depends, File, HTTPException, Response, UploadFile,
+)
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -246,6 +248,68 @@ async def discover_provider(
     result = catalog.discover_provider(db, prov)
     llm_router.invalidate()          # the catalog changed for everyone
     return result
+
+
+@router.get("/v1/admin/providers/{slug}/models")
+async def list_provider_models(
+    slug: str,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    The full catalog for ONE provider — every model, enabled or not.
+
+    This is the admin's curation view, so unlike the user-facing lists it hides
+    nothing: disabled rows are exactly the ones an admin may want to re-enable.
+    """
+    prov = db.query(Provider).filter(Provider.slug == slug.lower()).first()
+    if not prov:
+        raise HTTPException(status_code=404, detail=f"No provider {slug!r}.")
+    rows = (
+        db.query(ProviderModel)
+        .filter(ProviderModel.provider_id == prov.id)
+        .order_by(ProviderModel.upstream_model_id)
+        .all()
+    )
+    return {
+        "provider": prov.slug,
+        "models": [
+            {
+                "id": m.id,
+                "model": m.upstream_model_id,
+                "mode": m.mode.value if hasattr(m.mode, "value") else m.mode,
+                "publisher": m.publisher,
+                "enabled": m.enabled,
+            }
+            for m in rows
+        ],
+    }
+
+
+@router.patch("/v1/admin/models/{model_id}")
+async def toggle_model(
+    model_id: int,
+    payload: ToggleProviderRequest,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Enable / disable ONE catalog model, for everyone.
+
+    Same semantics as disabling a provider, one row narrower: nothing is
+    deleted, deployments stay, but v_live_deployments filters on pm.enabled so
+    a disabled model drops out of every user's routing set immediately.
+    Re-enabling restores it as it was.
+    """
+    row = db.query(ProviderModel).filter(ProviderModel.id == model_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No catalog model #{model_id}.")
+
+    row.enabled = payload.enabled
+    db.commit()
+    llm_router.invalidate()   # every user's callable set may have changed
+
+    return {"id": row.id, "model": row.upstream_model_id, "enabled": row.enabled}
 
 
 @router.post("/v1/admin/discover")
@@ -528,6 +592,96 @@ async def export_my_provider_keys(
     )
 
 
+@router.post("/v1/me/provider-keys/import")
+async def import_my_provider_keys(
+    background: BackgroundTasks,
+    file: UploadFile = File(...),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Restore MY provider keys from a CSV — the exact file /export produces.
+
+    Columns: provider, provider_name, label, api_key (provider_name is ignored;
+    the slug is the identity). Rows upsert by (me, provider, label) — re-importing
+    a backup is idempotent, and an updated key value replaces the stored one.
+    Each imported key fans out into deployments and is probed in the background,
+    exactly as if it had been added by hand.
+
+    Rows for providers an admin has not registered are SKIPPED and reported,
+    not failed: a user restore must not be able to create catalog entries.
+    """
+    raw = await file.read()
+    # Our export is UTF-8, but backups round-trip through Windows tooling that
+    # re-saves CSVs as UTF-16 (PowerShell, Excel). Extra columns are fine —
+    # DictReader ignores them — so tolerate both encodings rather than reject.
+    try:
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-16")
+        if "\x00" in text:               # utf-16 decoded as utf-8 garbage
+            text = raw.decode("utf-16")
+        reader = csv.DictReader(io.StringIO(text))
+        rows = list(reader)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Not a readable CSV file.")
+
+    if not rows or not {"provider", "api_key"} <= set(reader.fieldnames or []):
+        raise HTTPException(
+            status_code=400,
+            detail="Expected the backup format: provider, provider_name, label, api_key.",
+        )
+
+    providers = {p.slug: p for p in db.query(Provider).all()}
+    imported: List[str] = []
+    skipped: List[str] = []
+
+    for i, r in enumerate(rows, start=2):   # header = line 1
+        slug = (r.get("provider") or "").strip().lower()
+        value = (r.get("api_key") or "").strip()
+        label = (r.get("label") or "").strip() or None
+
+        prov = providers.get(slug)
+        if not prov:
+            skipped.append(f"line {i}: provider {slug or '?'!r} is not registered")
+            continue
+        if not prov.enabled:
+            skipped.append(f"line {i}: provider {slug!r} is disabled")
+            continue
+        try:
+            row = key_store.add_key(
+                db, user_id=user.id, provider_id=prov.id, value=value, label=label,
+            )
+        except ValueError as exc:
+            skipped.append(f"line {i}: {exc}")
+            continue
+
+        # First key for an empty catalog is the first that CAN read it —
+        # same rescue as the manual add path.
+        if not db.query(ProviderModel).filter(
+            ProviderModel.provider_id == prov.id
+        ).count():
+            if catalog.discover_provider(db, prov).get("added", 0):
+                key_store.fan_out(db, row)
+
+        background.add_task(_probe_and_refresh, row.id, user.id)
+        imported.append(f"{slug} · {row.label}")
+
+    llm_router.invalidate(user.id)
+    return {
+        "status": "probing" if imported else "nothing_imported",
+        "imported": len(imported),
+        "keys": imported,
+        "skipped": skipped,
+        "detail": (
+            f"Imported {len(imported)} key(s)"
+            + (f", skipped {len(skipped)}" if skipped else "")
+            + ". Models are being tested in the background."
+        ),
+    }
+
+
 @router.delete("/v1/me/provider-keys/{key_id}")
 async def delete_my_provider_key(
     key_id: int, user: User = Depends(current_user), db: Session = Depends(get_db),
@@ -537,6 +691,41 @@ async def delete_my_provider_key(
         raise HTTPException(status_code=404, detail=f"You have no provider key with id {key_id}.")
     llm_router.invalidate(user.id)
     return {"status": "deleted", "id": key_id}
+
+
+@router.post("/v1/me/provider-keys/{key_id}/probe")
+async def reprobe_my_key(
+    key_id: int,
+    background: BackgroundTasks,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Re-test ONE key — the narrowest probe there is.
+
+    The surgical sibling of /providers/{slug}/probe: one provider, one key,
+    nobody else's deployments touched. Use it when a single key looks stale
+    ("did topping up my second Groq key revive it?") without burning probe
+    quota on keys that were fine. No catalog refresh — that's /discover.
+    """
+    key = (
+        db.query(ProviderKey)
+        .filter(ProviderKey.id == key_id, ProviderKey.user_id == user.id)
+        .first()
+    )
+    if not key:
+        raise HTTPException(
+            status_code=404, detail=f"You have no provider key with id {key_id}."
+        )
+    if not key.is_active:
+        raise HTTPException(status_code=400, detail="That key is inactive — nothing to test.")
+
+    background.add_task(_probe_and_refresh, key.id, user.id)
+    return {
+        "status": "probing",
+        "key_id": key.id,
+        "detail": "Re-testing this key's models in the background. Poll GET /v1/me/models for results.",
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════

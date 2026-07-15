@@ -127,7 +127,14 @@ def _build(db: Session, user_id: int) -> Tuple[Router, List[str]]:
     }
 
     model_list: List[Dict[str, Any]] = []
+    # NVCF deployments (litellm_model 'nvcf/<id>') are served by the adapter in
+    # services/nvcf.py, NEVER by litellm — the prefix means nothing to it and
+    # could poison the whole Router build. They still count as callable models
+    # (see `names` below) so /v1/models and resolution know about them.
+    nvcf_rows = [r for r in rows if r["litellm_model"].startswith("nvcf/")]
     for r in rows:
+        if r["litellm_model"].startswith("nvcf/"):
+            continue
         params: Dict[str, Any] = {
             "model": r["litellm_model"],
             "api_key": plaintext[r["provider_key_id"]],   # passed in, never os.environ
@@ -155,7 +162,9 @@ def _build(db: Session, user_id: int) -> Tuple[Router, List[str]]:
         timeout=settings.REQUEST_TIMEOUT,
         **router_kwargs,
     )
-    names = sorted({d["model_name"] for d in model_list})
+    names = sorted(
+        {d["model_name"] for d in model_list} | {r["model"] for r in nvcf_rows}
+    )
     logger.info(
         "Router built for user %s: %d deployment(s) across %d model(s).",
         user_id, len(model_list), len(names),

@@ -146,6 +146,22 @@ def add_key(
 
     label = label or f"key-{crypto.mask(value)}"
 
+    # THE KEY VALUE ITSELF IS UNIQUE per (user, provider) — the same secret
+    # under two labels is not two keys, it's one quota counted twice: it doubles
+    # nothing, but doubles the probe traffic and fakes 'key backup' redundancy.
+    # Ciphertexts aren't comparable (random IV), so compare decrypted values —
+    # a user holds a handful of keys per provider, so this is cheap.
+    for other in db.query(ProviderKey).filter(
+        ProviderKey.user_id == user_id,
+        ProviderKey.provider_id == provider_id,
+        ProviderKey.label != label,
+    ):
+        if crypto.decrypt(other.key_ciphertext) == value:
+            raise ValueError(
+                f"This exact key is already saved as {other.label!r}. "
+                "The same key twice adds no quota and no redundancy."
+            )
+
     row = (
         db.query(ProviderKey)
         .filter(

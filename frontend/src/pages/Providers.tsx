@@ -12,7 +12,7 @@
  * look broken for ~20 seconds.
  */
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api, ApiError } from "../lib/api";
@@ -77,6 +77,24 @@ export default function Providers() {
     onSettled: () => setDiscovering(null),
   });
 
+  // Per-KEY "Test": the narrowest probe — one key, its deployments only.
+  // One provider, one key, nothing else re-tested.
+  const [testingKey, setTestingKey] = useState<number | null>(null);
+  const testKey = useMutation({
+    mutationFn: (id: number) => api.reprobeKey(id),
+    onMutate: (id) => {
+      setTestingKey(id);
+      setDiscoverMsg(null);
+    },
+    onSuccess: (r) => {
+      setDiscoverMsg(r.detail);
+      qc.invalidateQueries({ queryKey: ["my-keys"] });
+      qc.invalidateQueries({ queryKey: ["my-models"] });
+    },
+    onError: (e: ApiError) => setDiscoverMsg(e.message),
+    onSettled: () => setTestingKey(null),
+  });
+
   // Per-provider "Test keys": probe-only, no catalog refresh, no /models call.
   // The cheap way to answer "did fixing that key revive this provider?".
   const [testing, setTesting] = useState<string | null>(null);
@@ -104,6 +122,23 @@ export default function Providers() {
   const exportKeys = useMutation({
     mutationFn: api.exportProviderKeys,
     onMutate: () => setDiscoverMsg(null),
+    onError: (e: ApiError) => setDiscoverMsg(e.message),
+  });
+
+  // "Upload keys": the restore half of Backup. Same CSV, straight back in —
+  // each row upserts a key, fans out and probes like a manual add.
+  const fileRef = useRef<HTMLInputElement | null>(null);
+  const importKeys = useMutation({
+    mutationFn: (file: File) => api.importProviderKeys(file),
+    onMutate: () => setDiscoverMsg(null),
+    onSuccess: (r) => {
+      setDiscoverMsg(
+        r.skipped.length ? `${r.detail} Skipped: ${r.skipped.join("; ")}` : r.detail,
+      );
+      qc.invalidateQueries({ queryKey: ["my-keys"] });
+      qc.invalidateQueries({ queryKey: ["my-models"] });
+      qc.invalidateQueries({ queryKey: ["providers"] });
+    },
     onError: (e: ApiError) => setDiscoverMsg(e.message),
   });
 
@@ -154,6 +189,27 @@ export default function Providers() {
           </p>
         </div>
         <div className="flex gap-2">
+          {/* Restore from a backup CSV. Always visible — the whole point is
+              starting from zero keys after a reinstall. */}
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".csv,text/csv"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) importKeys.mutate(f);
+              e.target.value = "";   // same file can be re-picked
+            }}
+          />
+          <button
+            className="btn-sec"
+            onClick={() => fileRef.current?.click()}
+            disabled={importKeys.isPending}
+            title="Restore keys from a backup CSV (the file Backup keys downloads). Rows upsert by provider + label, so re-importing is safe."
+          >
+            {importKeys.isPending ? "Importing…" : "⬆ Upload keys"}
+          </button>
           {mine.length > 0 && (
             <button
               className="btn-sec"
@@ -256,6 +312,14 @@ export default function Providers() {
                             `${k.working_models}/${k.total_models} models working`
                           )}
                         </span>
+                        <button
+                          className="btn-sec text-xs"
+                          onClick={() => testKey.mutate(k.id)}
+                          disabled={testingKey !== null || testing !== null || discovering !== null}
+                          title="Re-test only THIS key against the existing catalog. Your other keys are untouched."
+                        >
+                          {testingKey === k.id ? "Testing…" : "Test"}
+                        </button>
                         <button
                           className="btn-dng text-xs"
                           onClick={() => remove.mutate(k.id)}
