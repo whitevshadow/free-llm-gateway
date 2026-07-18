@@ -27,7 +27,7 @@ from app.models.enums import ModelMode
 from app.models.provider import Provider
 from app.models.provider_key import ProviderKey
 from app.models.provider_model import ProviderModel
-from app.services import crypto, nvcf, presets
+from app.services import crypto, nvcf, nvidia_riva, presets
 from app.services.normalize import normalize_model_name, publisher_for
 
 logger = logging.getLogger("gateway.catalog")
@@ -77,7 +77,7 @@ def audio_kind(model_id: str) -> str:
     a TTS model cannot transcribe, so the probe and endpoints must not mix them.
     """
     lowered = model_id.lower()
-    if any(tok in lowered for tok in ("whisper", "transcribe")):
+    if any(tok in lowered for tok in ("whisper", "transcribe", "asr")):
         return "transcription"
     return "speech"
 
@@ -246,6 +246,38 @@ def discover_provider(
                         normalized_name=name.lower(),
                         publisher="Black Forest Labs",
                         mode=ModelMode.image,
+                    )
+                )
+                added += 1
+
+    # NVIDIA's Riva ASR models are NVCF functions too (see
+    # services/nvidia_riva.py) but, unlike the image ones, litellm SPEAKS this
+    # protocol natively — they ride the normal Router, just need their NVCF
+    # function id threaded through as an extra litellm_param (see
+    # llm_router.py / prober.py). litellm_model carries the function id as a
+    # '#'-suffix, so no schema change is needed.
+    if provider.slug == "nvidia_nim":
+        for name, fid in nvidia_riva.list_asr_functions(api_key):
+            model_id = f"{nvidia_riva.MODEL_PREFIX}nvidia/{name}"
+            litellm_model = f"{model_id}{nvidia_riva.SEP}{fid}"
+            seen.add(name)
+            row = existing.get(name)
+            if row:
+                row.litellm_model = litellm_model
+                row.normalized_name = normalize_model_name(model_id)
+                row.publisher = "NVIDIA"
+                row.mode = ModelMode.audio
+                row.enabled = True
+                updated += 1
+            else:
+                db.add(
+                    ProviderModel(
+                        provider_id=provider.id,
+                        upstream_model_id=name,
+                        litellm_model=litellm_model,
+                        normalized_name=normalize_model_name(model_id),
+                        publisher="NVIDIA",
+                        mode=ModelMode.audio,
                     )
                 )
                 added += 1

@@ -120,7 +120,30 @@ PRESETS: List[Dict[str, Optional[str]]] = [
     },
 ]
 
-_BY_SLUG = {p["slug"]: p for p in PRESETS}
+# ── KNOWN, BUT NOT FREE ───────────────────────────────────────────────────────
+#  Metadata for providers that are NOT offered in the "Add a provider" dropdown
+#  — they're paid/credit-based, and putting them in PRESETS would misrepresent
+#  the dropdown's "free at $0" promise — but that still benefit from base_url
+#  auto-fill and the custom_llm_provider plumbing below once an admin adds them
+#  by hand as CUSTOM. Merged into the same lookup as PRESETS; never returned by
+#  GET /v1/admin/provider-presets (that endpoint reads PRESETS directly).
+_KNOWN_NON_PRESET: List[Dict[str, Optional[str]]] = [
+    {
+        "slug": "longcat",
+        "name": "LongCat",
+        "base_url": "https://api.longcat.chat/openai/v1",
+        "docs_url": "https://longcat.chat/platform/docs/",
+        # litellm has no native 'longcat' integration, so it must be forced
+        # through the generic OpenAI-compatible client via custom_llm_provider.
+        # Once forced, litellm sends `model` to the upstream API VERBATIM —
+        # call_model_id() below strips the 'longcat/' prefix accordingly, or
+        # every call 404s against the real endpoint.
+        "custom_llm_provider": "openai",
+        "hint": "Paid (Token Pack / pay-as-you-go). LongCat-2.0, 1M context.",
+    },
+]
+
+_BY_SLUG = {p["slug"]: p for p in PRESETS + _KNOWN_NON_PRESET}
 
 
 def get(slug: str) -> Optional[Dict[str, Optional[str]]]:
@@ -146,3 +169,29 @@ def call_api_base(slug: str, stored_base_url: Optional[str]) -> Optional[str]:
     if p and p.get("native_routing"):
         return None
     return stored_base_url
+
+
+def custom_llm_provider_for(slug: Optional[str]) -> Optional[str]:
+    """
+    Force litellm onto a specific integration for providers it has no native
+    prefix for (LongCat has no 'longcat/' integration in litellm). None means
+    "let litellm auto-detect from the model string", which is correct for
+    every ordinary preset.
+    """
+    p = get(slug) if slug else None
+    return p.get("custom_llm_provider") if p else None
+
+
+def call_model_id(slug: Optional[str], litellm_model: str) -> str:
+    """
+    The `model` string to actually hand to litellm for a call.
+
+    A provider forced onto a specific integration via custom_llm_provider has
+    that integration send `model` to the upstream API verbatim, so the stored
+    'slug/upstream-id' form must be stripped back to the bare upstream id —
+    otherwise the request 404s. Ordinary providers are unaffected: litellm's
+    own prefix parsing strips its own prefix, so the full form must stay.
+    """
+    if slug and custom_llm_provider_for(slug) and litellm_model.startswith(f"{slug}/"):
+        return litellm_model[len(slug) + 1:]
+    return litellm_model

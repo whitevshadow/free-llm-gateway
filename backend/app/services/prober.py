@@ -38,7 +38,7 @@ from app.models.enums import ModelHealth, ModelMode
 from app.models.provider import Provider
 from app.models.provider_key import ProviderKey
 from app.models.provider_model import ProviderModel
-from app.services import crypto, nvcf, presets
+from app.services import crypto, nvcf, nvidia_riva, presets
 from app.services.catalog import audio_kind
 
 logger = logging.getLogger("gateway.prober")
@@ -206,6 +206,7 @@ def probe_tts_voice(litellm_model: str) -> str:
 async def _probe_one(
     litellm_model: str, api_key: str, api_base: Optional[str],
     mode: ModelMode = ModelMode.chat,
+    custom_llm_provider: Optional[str] = None,
 ) -> Dict:
     """
     One cheap request, with the key passed IN — never via os.environ.
@@ -215,21 +216,44 @@ async def _probe_one(
     forever. Chat models get a 1-token completion; embedding models embed the
     word "ping"; whisper-family models transcribe a ~0.25s generated WAV; TTS
     models speak "ping"; image models generate one small image.
+
+    `custom_llm_provider` forces litellm onto a specific integration for
+    providers it has no native prefix for (LongCat) — see
+    presets.custom_llm_provider_for. Once forced, the call must use the bare
+    upstream id, not the stored 'slug/id' form, or the request 404s.
     """
     started = datetime.now(timezone.utc)
+    call_model = litellm_model
+    extra: Dict[str, str] = {}
+    if custom_llm_provider:
+        extra["custom_llm_provider"] = custom_llm_provider
+        call_model = litellm_model.split("/", 1)[1] if "/" in litellm_model else litellm_model
     try:
-        if nvcf.is_nvcf_model(litellm_model):
+        if nvidia_riva.is_riva_model(litellm_model):
+            # NVIDIA Riva ASR — litellm speaks this protocol natively, but it
+            # needs the bare model id, the Riva gRPC endpoint, and the NVCF
+            # function id, not the provider's normal chat api_base/api_key.
+            model_id, function_id = nvidia_riva.split_function_id(litellm_model)
+            await litellm.atranscription(
+                model=model_id,
+                file=_probe_wav(),
+                api_key=api_key,
+                api_base=nvidia_riva.GRPC_ENDPOINT,
+                nvcf_function_id=function_id,
+                timeout=PROBE_TIMEOUT,
+            )
+        elif nvcf.is_nvcf_model(litellm_model):
             # NVIDIA cloud function — litellm cannot speak this surface at all;
             # the adapter runs the cheapest real generation instead.
             await nvcf.probe_image(litellm_model, api_key)
         elif mode is ModelMode.embedding:
-            kwargs: Dict = {}
+            kwargs: Dict = dict(extra)
             # NVIDIA's retrieval models are asymmetric and REQUIRE input_type;
             # without it the probe 400s and a healthy model looks broken.
             if litellm_model.startswith("nvidia_nim/"):
                 kwargs["input_type"] = "query"
             await litellm.aembedding(
-                model=litellm_model,
+                model=call_model,
                 input=["ping"],
                 api_key=api_key,
                 api_base=api_base,
@@ -239,37 +263,41 @@ async def _probe_one(
         elif mode is ModelMode.audio:
             if audio_kind(litellm_model) == "transcription":
                 await litellm.atranscription(
-                    model=litellm_model,
+                    model=call_model,
                     file=_probe_wav(),
                     api_key=api_key,
                     api_base=api_base,
                     timeout=PROBE_TIMEOUT,
+                    **extra,
                 )
             else:
                 await litellm.aspeech(
-                    model=litellm_model,
+                    model=call_model,
                     input="ping",
                     voice=probe_tts_voice(litellm_model),
                     api_key=api_key,
                     api_base=api_base,
                     timeout=PROBE_TIMEOUT,
+                    **extra,
                 )
         elif mode is ModelMode.image:
             await litellm.aimage_generation(
-                model=litellm_model,
+                model=call_model,
                 prompt="ping",
                 api_key=api_key,
                 api_base=api_base,
                 timeout=PROBE_TIMEOUT,
+                **extra,
             )
         else:
             await litellm.acompletion(
-                model=litellm_model,
+                model=call_model,
                 messages=[{"role": "user", "content": "ping"}],
                 max_tokens=1,
                 api_key=api_key,
                 api_base=api_base,
                 timeout=PROBE_TIMEOUT,
+                **extra,
             )
         latency = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
         return {"status": ModelHealth.available, "http_code": 200,
@@ -339,6 +367,7 @@ async def probe_deployments(deployment_ids: List[int]) -> Dict:
                     # (Cohere) must get None or the probe 404s (see presets).
                     presets.call_api_base(provider.slug, provider.base_url),
                     mode=model.mode,
+                    custom_llm_provider=presets.custom_llm_provider_for(provider.slug),
                 )
                 # Tick as each probe RETURNS, not when results are written — the
                 # bar should move during the slow part, not jump at the end.

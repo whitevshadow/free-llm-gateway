@@ -50,7 +50,7 @@ from app.models.provider import Provider
 from app.models.provider_key import ProviderKey
 from app.models.router_config import RouterConfig
 from app.models.views import v_live_deployments
-from app.services import crypto, presets
+from app.services import crypto, nvidia_riva, presets
 
 logger = logging.getLogger("gateway.router")
 
@@ -122,8 +122,10 @@ def _build(db: Session, user_id: int) -> Tuple[Router, List[str]]:
 
     # base_url is what discovery calls; native-routing providers (Cohere) must
     # NOT receive it as api_base on real calls — litellm knows their endpoint.
+    providers_by_id = {p.id: p for p in db.query(Provider)}
     bases = {
-        p.id: presets.call_api_base(p.slug, p.base_url) for p in db.query(Provider)
+        pid: presets.call_api_base(p.slug, p.base_url)
+        for pid, p in providers_by_id.items()
     }
 
     model_list: List[Dict[str, Any]] = []
@@ -135,13 +137,33 @@ def _build(db: Session, user_id: int) -> Tuple[Router, List[str]]:
     for r in rows:
         if r["litellm_model"].startswith("nvcf/"):
             continue
-        params: Dict[str, Any] = {
-            "model": r["litellm_model"],
-            "api_key": plaintext[r["provider_key_id"]],   # passed in, never os.environ
-        }
-        base = bases.get(r["provider_id"])
-        if base:
-            params["api_base"] = base
+        if nvidia_riva.is_riva_model(r["litellm_model"]):
+            # NVIDIA Riva ASR — litellm speaks this protocol natively, but
+            # each function needs its own NVCF function id and the Riva gRPC
+            # endpoint rather than the provider's normal chat api_base (see
+            # services/nvidia_riva.py).
+            model_id, function_id = nvidia_riva.split_function_id(r["litellm_model"])
+            params: Dict[str, Any] = {
+                "model": model_id,
+                "api_key": plaintext[r["provider_key_id"]],
+                "api_base": nvidia_riva.GRPC_ENDPOINT,
+                "nvcf_function_id": function_id,
+            }
+        else:
+            slug = providers_by_id[r["provider_id"]].slug if r["provider_id"] in providers_by_id else None
+            params = {
+                "model": presets.call_model_id(slug, r["litellm_model"]),
+                "api_key": plaintext[r["provider_key_id"]],   # passed in, never os.environ
+            }
+            # Providers litellm has no native prefix for (LongCat) must be
+            # forced onto a specific integration — see
+            # presets.custom_llm_provider_for.
+            custom_llm_provider = presets.custom_llm_provider_for(slug)
+            if custom_llm_provider:
+                params["custom_llm_provider"] = custom_llm_provider
+            base = bases.get(r["provider_id"])
+            if base:
+                params["api_base"] = base
         if r["rpm"]:
             params["rpm"] = r["rpm"]
 

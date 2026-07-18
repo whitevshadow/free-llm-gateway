@@ -7,7 +7,10 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 
 # LLM Abstraction Layer (Router: load balancing, cooldowns, fallbacks)
-litellm>=1.83.0
+# >=1.92.0 for the native `nvidia_riva` integration (NVIDIA Riva ASR over
+# gRPC); the [stt-nvidia-riva] extra pulls in nvidia-riva-client, which that
+# integration needs to speak the wire protocol.
+litellm[stt-nvidia-riva]>=1.92.0
 
 # YAML parsing for the free-provider model pool
 pyyaml>=6.0
