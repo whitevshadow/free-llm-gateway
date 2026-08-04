@@ -1,19 +1,27 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  Multi-LLM Gateway — the whole project in Docker. TWO services, ONE port.
+#  Multi-LLM Gateway — the whole project in Docker. THREE services.
 #
 #      cp .env.example .env       # then fill SECRET_KEY + ENCRYPTION_KEY
 #      docker compose up -d --build
 #
-#      → http://localhost:8080          the UI
-#      → http://localhost:8080/v1/...   the API
-#      → http://localhost:8080/docs     Swagger
+#      → http://localhost:3000          the dashboard (OmniRoute UI)
+#      → http://localhost:8000/v1/...   the API, for Claude Code / OpenAI clients
+#      → http://localhost:8000/docs     Swagger
 #
 #      docker compose logs app | grep -A2 "BOOTSTRAP ADMIN KEY"
 #        ^ your first admin key, printed ONCE. Copy it — it is unrecoverable.
+#          It is also what you paste into the dashboard's login form.
 #
-#  ONE PROCESS, ONE PORT, ONE ORIGIN. The `app` container's uvicorn serves the
-#  compiled SPA AND the API (mount_frontend, baked into the image), so the
-#  browser never talks to a second host — no nginx, and no CORS to configure.
+#  WHY TWO APP CONTAINERS NOW
+#    The dashboard used to be a compiled SPA baked into the API image, served by
+#    the same uvicorn process on one port. The ported OmniRoute UI is a Next.js
+#    server — it renders on demand and runs the `/api/*` bridge server-side — so
+#    it needs its own process.
+#
+#    The browser only ever talks to the dashboard. The dashboard's bridge calls
+#    the API over the compose network at http://app:8000, an address that never
+#    leaves Docker. One browser origin, so still no CORS to configure, and the
+#    gateway key is exchanged for an httpOnly cookie that JavaScript cannot read.
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -44,10 +52,10 @@ services:
     # ports:
     #   - "5432:5432"
 
-  # ── app — FastAPI + LiteLLM. Serves the SPA AND the API on one port. ───────
+  # ── app — FastAPI + LiteLLM. The API. ─────────────────────────────────────
   app:
     build:
-      context: .              # repo root: needs backend/ and frontend/
+      context: .              # repo root: needs backend/
       dockerfile: Dockerfile
     image: multi-llm-gateway-api
     environment:
@@ -58,7 +66,7 @@ services:
       # it, and the ports: mapping below publishes it. Change it in ONE place.
       # IMPORTANT (Coolify): the service domain must carry the same port —
       # e.g. https://your.domain:1050 when PORT=1050 — or Traefik 502s.
-      PORT: ${PORT:-1080}
+      PORT: ${PORT:-8000}
 
       SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
       # Encrypts users' provider keys at rest. If this ever changes, every stored
@@ -77,9 +85,18 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-120}
 
-      # The browser reaches the API through nginx on the SAME origin, so no
-      # cross-origin request is ever made and CORS is moot.
+      # The browser never calls this service directly — the dashboard's bridge
+      # does, server-side, over the compose network. So no cross-origin request
+      # is ever made from a page and CORS stays moot.
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
+
+      # Session cookie for the dashboard login (backend/app/api/session_auth.py).
+      # SESSION_COOKIE_SECURE must stay false while the dashboard is served over
+      # plain HTTP on localhost: browsers silently drop a Secure cookie sent over
+      # http://, which looks exactly like "login succeeded but I'm still logged
+      # out". Turn it on once you terminate TLS in front of the dashboard.
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
 
       # NOTE: there are deliberately NO provider API keys here (no GROQ_API_KEY,
       # no NVIDIA_API_KEY). An env var is process-global, so a key set here would
@@ -94,6 +111,36 @@ services:
     # process all agree. Set PORT once in .env (or the Coolify UI).
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
+
+  # ── dashboard — the OmniRoute UI, ported onto this gateway ────────────────
+  #  Next.js server. Renders the dashboard and runs the `/api/*` bridge, which
+  #  translates the UI's ~210 original API paths into calls against `app`.
+  #  Paths the gateway does not implement yet answer 501 with a "not wired"
+  #  envelope, so those pages render an honest empty state instead of throwing
+  #  — see frontend/src/bridge/notImplemented.ts and OMNIROUTE_INTEGRATION.md.
+  dashboard:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # The address CLIENTS use — the gateway's published port, not the
+        # dashboard's. This is what the Endpoints screen shows and what every
+        # copy-paste snippet contains, so it must be reachable from wherever the
+        # client runs. Inlined at build time (see frontend/Dockerfile), so a
+        # change to PORT needs `docker compose build dashboard`.
+        NEXT_PUBLIC_BASE_URL: ${GATEWAY_PUBLIC_URL:-http://localhost:${PORT:-8000}}
+    image: multi-llm-gateway-dashboard
+    environment:
+      # Container-internal address of the API. Never reachable from the browser,
+      # which is the point: the bridge is the only thing that calls it.
+      GATEWAY_URL: http://app:${PORT:-8000}
+      PORT: 3000
+    depends_on:
+      app:
+        condition: service_started
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-3000}:3000"
 
 volumes:
   pg_data:

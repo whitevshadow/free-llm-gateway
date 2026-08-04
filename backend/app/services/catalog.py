@@ -27,8 +27,8 @@ from app.models.enums import ModelMode
 from app.models.provider import Provider
 from app.models.provider_key import ProviderKey
 from app.models.provider_model import ProviderModel
-from app.services import crypto, nvcf, nvidia_riva, presets
-from app.services.normalize import normalize_model_name, publisher_for
+from app.services import crypto, deepseek_web, nvcf, nvidia_riva, presets
+from app.services.normalize import family_key, normalize_model_name, publisher_for
 
 logger = logging.getLogger("gateway.catalog")
 
@@ -126,8 +126,12 @@ def fetch_model_ids(models_url: str, api_key: str) -> List[str]:
     GET the model catalog. Returns [] on any failure — discovery degrades,
     never crashes.
 
-    Tolerates both response shapes in the wild: OpenAI's {"data": [{id}, …]}
-    and GitHub's bare [{id}, …] array.
+    Tolerates the three response shapes in the wild: OpenAI's {"data": [{id}, …]},
+    GitHub's bare [{id}, …] array, and {"models": [{id}, …]} (AionLabs and others).
+
+    The third shape matters because it fails SILENTLY: `.get("data", [])` returns
+    an empty list, so the provider discovers zero models and looks like a bad key
+    rather than an unrecognised envelope.
     """
     try:
         resp = httpx.get(
@@ -137,7 +141,10 @@ def fetch_model_ids(models_url: str, api_key: str) -> List[str]:
         )
         resp.raise_for_status()
         body = resp.json()
-        items = body if isinstance(body, list) else body.get("data", [])
+        if isinstance(body, list):
+            items = body
+        else:
+            items = body.get("data") or body.get("models") or []
         return [m["id"] for m in items if isinstance(m, dict) and m.get("id")]
     except Exception as exc:
         logger.warning("Model discovery failed for %s: %s", models_url, exc)
@@ -167,11 +174,17 @@ def discover_provider(
     if not api_key:
         return {"provider": provider.slug, "error": "no active key available for discovery"}
 
-    # Presets may override where the catalog lives (GitHub's is not {base}/models).
-    preset = presets.get(provider.slug)
-    models_url = (preset or {}).get("models_url") or f"{base.rstrip('/')}/models"
-
-    ids = fetch_model_ids(models_url, api_key)
+    # Browser-session providers have no catalogue endpoint at all — their models
+    # are whatever the web UI offers, which is a fixed list. Serve it directly
+    # rather than GETting a /models that does not exist and reporting the
+    # provider as broken.
+    if provider.slug == deepseek_web.PROVIDER_SLUG:
+        ids = list(deepseek_web.MODELS)
+    else:
+        # Presets may override where the catalog lives (GitHub's is not {base}/models).
+        preset = presets.get(provider.slug)
+        models_url = (preset or {}).get("models_url") or f"{base.rstrip('/')}/models"
+        ids = fetch_model_ids(models_url, api_key)
     if not ids:
         return {"provider": provider.slug, "error": "provider returned no models"}
 
@@ -232,7 +245,7 @@ def discover_provider(
             row = existing.get(name)
             if row:
                 row.litellm_model = f"{nvcf.MODEL_PREFIX}{fid}"
-                row.normalized_name = name.lower()
+                row.normalized_name = family_key(name)
                 row.publisher = "Black Forest Labs"
                 row.mode = ModelMode.image
                 row.enabled = True
@@ -243,7 +256,7 @@ def discover_provider(
                         provider_id=provider.id,
                         upstream_model_id=name,
                         litellm_model=f"{nvcf.MODEL_PREFIX}{fid}",
-                        normalized_name=name.lower(),
+                        normalized_name=family_key(name),
                         publisher="Black Forest Labs",
                         mode=ModelMode.image,
                     )

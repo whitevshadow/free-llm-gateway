@@ -38,15 +38,30 @@ from app.models.enums import ModelHealth, ModelMode
 from app.models.provider import Provider
 from app.models.provider_key import ProviderKey
 from app.models.provider_model import ProviderModel
-from app.services import crypto, nvcf, nvidia_riva, presets
+from app.services import (
+    crypto, deepseek_web, health_history, nvcf, nvidia_riva, presets,
+)
 from app.services.catalog import audio_kind
 
 logger = logging.getLogger("gateway.prober")
 
-# How many probes may be in flight at once. Deliberately small: these all hit the
-# SAME provider with the SAME key, so this is literally the number of concurrent
-# requests we are pointing at one free-tier account.
+# How many probes may be in flight at once PER KEY. Deliberately small: probes
+# sharing a key all hit the SAME free-tier account, so this is literally the
+# number of concurrent requests we are pointing at it.
+#
+# PER KEY, not per run, and that distinction is the whole point. probe_key does
+# hit one account, but probe_user ("Refresh" on Deployments) spans every key the
+# user holds — a single global gate would queue 245 NVIDIA probes ahead of 26
+# Cohere ones for no reason, because Cohere's rate limit knows nothing about
+# NVIDIA's. Serialising them turned a full refresh into a ~20 minute job that
+# never finished before something restarted the app, which is why most rows on
+# that screen read "checked 12d ago".
 MAX_CONCURRENCY = 4
+
+# Ceiling across ALL keys in one run, so "re-test everything" on an account with
+# a dozen keys cannot open fifty sockets at once. High enough that the per-key
+# limit stays the binding constraint for any realistic number of keys.
+MAX_TOTAL_CONCURRENCY = 24
 
 PROBE_TIMEOUT = 20            # seconds per probe
 
@@ -229,7 +244,12 @@ async def _probe_one(
         extra["custom_llm_provider"] = custom_llm_provider
         call_model = litellm_model.split("/", 1)[1] if "/" in litellm_model else litellm_model
     try:
-        if nvidia_riva.is_riva_model(litellm_model):
+        if deepseek_web.is_deepseek_web_model(litellm_model):
+            # Browser-session provider — litellm cannot speak its protocol at
+            # all (per-request proof-of-work + a private SSE dialect), so the
+            # probe goes through the same executor that serves real traffic.
+            await deepseek_web.probe(litellm_model, api_key)
+        elif nvidia_riva.is_riva_model(litellm_model):
             # NVIDIA Riva ASR — litellm speaks this protocol natively, but it
             # needs the bare model id, the Riva gRPC endpoint, and the NVCF
             # function id, not the provider's normal chat api_base/api_key.
@@ -334,7 +354,11 @@ async def probe_deployments(deployment_ids: List[int]) -> Dict:
         return {"probed": 0, "skipped_inflight": skipped}
 
     _inflight.update(deployment_ids)
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+    # One gate per key (the account being rate-limited) plus one global ceiling.
+    # Created lazily per run: semaphores bind to the running loop, so they must
+    # not outlive it as module state.
+    per_key: Dict[int, asyncio.Semaphore] = {}
+    total_sem = asyncio.Semaphore(MAX_TOTAL_CONCURRENCY)
     db: Session = SessionLocal()
 
     try:
@@ -360,7 +384,8 @@ async def probe_deployments(deployment_ids: List[int]) -> Dict:
                 plaintext[key.id] = crypto.decrypt(key.key_ciphertext)
 
         async def run(dep, model, key, provider):
-            async with sem:
+            sem = per_key.setdefault(key.id, asyncio.Semaphore(MAX_CONCURRENCY))
+            async with total_sem, sem:
                 result = await _probe_one(
                     model.litellm_model, plaintext[key.id],
                     # Not provider.base_url verbatim: native-routing providers
@@ -388,6 +413,18 @@ async def probe_deployments(deployment_ids: List[int]) -> Dict:
                 continue
             dep_id, res = item
             dep = by_id[dep_id]
+
+            # Health timeline (SRS §20). Called BEFORE the status is reassigned —
+            # it reads the previous value off `dep` to fill from_status, and
+            # writes nothing unless the status actually changed.
+            health_history.record_transition(
+                db, dep, res["status"],
+                source="probe",
+                http_code=res["http_code"],
+                latency_ms=res["latency_ms"],
+                error=res["error"],
+            )
+
             dep.status = res["status"]
             dep.http_code = res["http_code"]
             dep.latency_ms = res["latency_ms"]

@@ -440,11 +440,20 @@ CREATE TABLE request_logs (
     latency_ms         INTEGER,
     status_code        INTEGER  NOT NULL DEFAULT 200,
     error_message      TEXT,
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Combo attribution. NULL for a direct model call. Without these, a call made
+    -- through a combo is indistinguishable from a direct one, and the dashboard's
+    -- per-combo rates would have to be invented rather than measured.
+    -- combo_attempt is the 1-based position of the target that ANSWERED: > 1 means
+    -- the chain fell back, which is exactly the "fallback rate" the UI shows.
+    combo_name         VARCHAR(120),
+    combo_attempt      INTEGER
 );
 CREATE INDEX idx_logs_user  ON request_logs(user_id, created_at DESC);
 CREATE INDEX idx_logs_gwkey ON request_logs(gateway_api_key_id);
 CREATE INDEX idx_logs_pkey  ON request_logs(provider_key_id, created_at DESC);
+CREATE INDEX ix_logs_combo  ON request_logs(user_id, combo_name, created_at DESC);
 
 
 -- ════════════════════════════════════════════════════════════════════════════
@@ -466,6 +475,51 @@ CREATE TABLE router_config (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TRIGGER trg_router_touch BEFORE UPDATE ON router_config
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+
+-- ════════════════════════════════════════════════════════════════════════════
+--  8b. COMBOS — named, ORDERED routing chains, addressable as a model name.
+--
+--     router_config says how the Router behaves over the user's whole pool. A
+--     combo is the other question: "call THIS target first, then that one" —
+--     a user-defined candidate list plus a named selection policy. A client may
+--     send `model: "free-stack"` and the gateway walks the chain
+--     (app/services/combo_router.py).
+--
+--     models/config are JSONB because a step is not a fixed tuple: the builder
+--     writes model steps AND references to other combos, plus an open-ended
+--     runtime config. Everything the SERVER routes on is read and validated in
+--     combo_router; the rest only has to round-trip to the UI. What is NOT in
+--     JSON is what the database must enforce — ownership and name uniqueness.
+--
+--     The name is unique PER USER, not globally: two users may both own
+--     "free-stack" and they resolve to different targets, because resolution is
+--     always scoped by user_id.
+-- ════════════════════════════════════════════════════════════════════════════
+CREATE TABLE combos (
+    id          BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id     BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name        VARCHAR(120) NOT NULL,
+    description TEXT,
+    -- One of combo_router.STRATEGIES. Text, not an enum: the strategy list grows
+    -- with the routing engine, and an unknown value degrades to definition order
+    -- rather than failing a live call.
+    strategy    VARCHAR(48) NOT NULL DEFAULT 'priority',
+    models      JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    config      JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    -- Listed and editable, but refuses traffic. The dashboard's per-combo toggle.
+    is_active   BOOLEAN     NOT NULL DEFAULT true,
+    is_hidden   BOOLEAN     NOT NULL DEFAULT false,
+    -- Card order in the dashboard. NOT a routing signal — target order inside a
+    -- combo is `models`.
+    sort_order  INTEGER     NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_combos_user_name UNIQUE (user_id, name)
+);
+CREATE INDEX ix_combos_user_sort ON combos(user_id, sort_order);
+CREATE TRIGGER trg_combos_touch BEFORE UPDATE ON combos
     FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
 
 

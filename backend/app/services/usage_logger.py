@@ -32,6 +32,8 @@ def log_v1_usage(
     latency: float = 0.0,
     status_code: int = 200,
     error_message: Optional[str] = None,
+    combo_name: Optional[str] = None,
+    combo_attempt: Optional[int] = None,
 ) -> None:
     """Persist one usage row. Best-effort; swallows all errors."""
     usage = usage or {}
@@ -65,6 +67,10 @@ def log_v1_usage(
                     latency_ms=int(round((latency or 0.0) * 1000)),
                     status_code=status_code,
                     error_message=error_message,
+                    # NULL unless the call was addressed to a combo. See
+                    # models/request_log.py for why this cannot be derived later.
+                    combo_name=combo_name,
+                    combo_attempt=combo_attempt,
                 )
             )
             db.commit()

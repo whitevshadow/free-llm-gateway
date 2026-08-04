@@ -51,17 +51,70 @@ _MODEL_ALIASES = {
     "gpt-oss-20b": "openai/gpt-oss-20b",
 }
 
+# ── Bare-id org inference (CURATED PREFIXES) ─────────────────────────────────
+#  Some providers drop the org segment for their OWN models while aggregators
+#  keep it, which splits one model into two families:
+#
+#      gemini/models/gemini-3-pro-image  → gemini-3-pro-image
+#      openrouter/google/gemini-3-pro-image → google/gemini-3-pro-image
+#
+#  Same weights, two family keys, so they never share a fallback group and the
+#  registry reports no provider redundancy for any of them. Enumerating each
+#  model in _MODEL_ALIASES would work and would need a new line every time
+#  Google ships a variant, so the rule is written once per FAMILY instead.
+#
+#  Still curated, and still narrow: only names whose prefix identifies exactly
+#  one publisher appear here. 'llama' and 'qwen' are deliberately ABSENT even
+#  though _BARE_PREFIX_RULES attributes them — those names are fine-tuned and
+#  re-published by many orgs, so inferring an org from the prefix would fuse
+#  genuinely different models. Publisher attribution can afford to guess; a
+#  routing family key cannot.
+_BARE_ORG_RULES = [
+    ("gemini-", "google"),
+    ("imagen-", "google"),
+    ("gemma-", "google"),
+    ("whisper-", "openai"),
+    ("gpt-oss-", "openai"),
+]
+
 
 def normalize_model_name(litellm_model: str) -> str:
-    """Family key for cross-provider grouping (prefix + tag stripped, lowercased)."""
-    s = upstream_id(litellm_model)
-    s = s.split(":", 1)[0]          # drop ':free' and similar tags
+    """
+    Family key for a full litellm model string (`<prefix>/<upstream id>`).
+
+    Only for strings that CARRY a provider prefix — the first segment is
+    discarded as one. Ids that were never prefixed (NVIDIA's NVCF functions are
+    listed as bare 'flux.1-dev') must use `family_key`, or an org segment gets
+    eaten as if it were a provider.
+    """
+    return family_key(upstream_id(litellm_model))
+
+
+def family_key(upstream: str) -> str:
+    """
+    The shared normalization, applied to an id with NO litellm provider prefix.
+
+    Factored out because `resolve_requested_model` must apply the SAME rules to
+    a client's spelling. If the two drifted, a model would be stored under one
+    key and be unreachable under the name the registry advertises.
+    """
+    s = upstream.split(":", 1)[0]   # drop ':free' and similar tags
     s = s.strip().lower()
+    # Gemini lists ids as 'models/gemini-2.5-flash'. Discovery already strips
+    # that before building the litellm string, but a client can send the raw
+    # spelling straight to resolve_requested_model — and 'models' is not an org,
+    # so treating it as one would key the family under a namespace nothing else
+    # uses.
+    if s.startswith("models/"):
+        s = s[len("models/"):]
     if s in _MODEL_ALIASES:
         return _MODEL_ALIASES[s]
     if "/" in s:
         org, rest = s.split("/", 1)
-        s = f"{_ORG_ALIASES.get(org, org)}/{rest}"
+        return f"{_ORG_ALIASES.get(org, org)}/{rest}"
+    for prefix, org in _BARE_ORG_RULES:
+        if s.startswith(prefix):
+            return f"{org}/{s}"
     return s
 
 
@@ -83,12 +136,8 @@ def resolve_requested_model(requested: str, available: set) -> str | None:
     if requested in available:
         return requested
 
-    n = requested.strip().lower().split(":", 1)[0]
-    if n in _MODEL_ALIASES:
-        n = _MODEL_ALIASES[n]
-    elif "/" in n:
-        org, rest = n.split("/", 1)
-        n = f"{_ORG_ALIASES.get(org, org)}/{rest}"
+    # Exactly the rules the family key was built with — see family_key.
+    n = family_key(requested)
     if n in available:
         return n
 

@@ -70,5 +70,17 @@ class RequestLog(Base):
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow, index=True)
 
+    # ── combo attribution ───────────────────────────────────────────────────
+    # NULL for a direct model call. Set when the request was addressed to a combo
+    # (models/combo.py), which is otherwise invisible here: `requested_model`
+    # holds the combo's name but nothing says whether it WAS a combo, and the
+    # answering deployment says nothing about which step produced it.
+    #
+    # combo_attempt is the 1-based position of the target that ANSWERED, so
+    # `> 1` means the chain fell back — the one number the combo dashboard needs
+    # and the only one that cannot be reconstructed after the fact.
+    combo_name = Column(String(120), nullable=True)
+    combo_attempt = Column(Integer, nullable=True)
+
     def __repr__(self) -> str:
         return f"<RequestLog id={self.id} {self.requested_model!r} {self.status_code}>"

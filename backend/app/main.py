@@ -33,7 +33,10 @@ from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.api.router import api_router
-from app.api import openai_compat, anthropic_compat, admin, me
+from app.api import (
+    openai_compat, anthropic_compat, admin, me, session_auth, dashboard, srs_gaps,
+    validation, settings as settings_api, playground, combos,
+)
 from app.middleware.request_id import RequestIDMiddleware
 from app.middleware.logging_middleware import LoggingMiddleware
 from app.middleware.compression import ConditionalGZipMiddleware
@@ -275,6 +278,29 @@ app.include_router(openai_compat.router, tags=["OpenAI-compatible"])
 app.include_router(anthropic_compat.router, tags=["Anthropic-compatible"])
 app.include_router(admin.router, tags=["Admin"])
 app.include_router(me.router, tags=["Me"])
+# Browser session endpoints for the dashboard. Registered alongside the rest of
+# /v1 so the dashboard's bridge reaches them at the same origin as everything
+# else it calls.
+app.include_router(session_auth.router)
+# Dashboard read surfaces (SRS §20): deployments, status board, health timeline,
+# latency series, error feed.
+app.include_router(dashboard.router)
+# Test a provider key before storing it — what the dashboard's "Check" button
+# calls. Writes nothing.
+app.include_router(validation.router)
+# Dashboard preferences, per-provider parameter filters, and the connection
+# actions the providers page performs.
+app.include_router(settings_api.router)
+# Playground presets + prompt improvement. Chat itself goes through
+# /v1/chat/completions like any other client.
+app.include_router(playground.router)
+# Combos: named routing chains the caller can address as a model name. CRUD plus
+# the builder's options, per-combo metrics, and the test/simulate previews.
+app.include_router(combos.router)
+# Endpoints the SRS declares but the implementation does not have (§4 registration,
+# §5 three-role RBAC). They return a documented 501 so the gap is visible rather
+# than looking like a routing bug. Delete when the gaps close.
+app.include_router(srs_gaps.router)
 
 
 # ───────────────────────────────────────────────────────────────

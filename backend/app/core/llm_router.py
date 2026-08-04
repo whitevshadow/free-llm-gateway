@@ -50,7 +50,9 @@ from app.models.provider import Provider
 from app.models.provider_key import ProviderKey
 from app.models.router_config import RouterConfig
 from app.models.views import v_live_deployments
-from app.services import crypto, nvidia_riva, presets
+from app.services import (
+    circuit_breaker, crypto, deepseek_web, health_history, nvidia_riva, presets,
+)
 
 logger = logging.getLogger("gateway.router")
 
@@ -98,6 +100,109 @@ def _apply_pin(rows: List[Any], pinned_provider_id: Optional[int]) -> List[Any]:
     ]
 
 
+def callable_deployments(db: Session, user_id: int) -> List[Dict[str, Any]]:
+    """
+    This user's callable deployments, each with the litellm kwargs to CALL it.
+
+    One entry per deployment:
+
+        {deployment_id, model, litellm_model, provider_id, provider_key_id,
+         mode, params}
+
+    where `params` is exactly what `_build` puts in a model_list entry's
+    `litellm_params` — model id, decrypted key, api_base, rpm, and any provider
+    quirk (Riva endpoints, forced custom_llm_provider).
+
+    WHY THIS IS PUBLIC
+        The Router load-balances a family name across every deployment behind it,
+        which is right for `model: "gpt-oss-120b"` and wrong for a combo step that
+        says "this model, on THIS account". Combo routing (services/combo_router.py)
+        picks one entry itself and calls litellm directly with these params, so
+        pinning is exact instead of hopeful. Both paths read the same view and the
+        same decrypted keys, so key isolation is identical.
+
+    Includes nothing litellm cannot call: NVCF and browser-session deployments
+    are left OUT for the same reason they are left out of the model_list.
+
+    The provider circuit breaker IS applied (an open provider is down for
+    everyone). The per-user provider PIN is deliberately NOT: a pin is a
+    preference over an unordered pool, and a combo step names its target
+    explicitly — silently filtering out a step the user chose would make the
+    combo lie about what it does.
+    """
+    rows = db.execute(
+        select(v_live_deployments).where(v_live_deployments.c.user_id == user_id)
+    ).mappings().all()
+
+    blocked = circuit_breaker.blocked_provider_ids(db)
+    if blocked:
+        rows = [r for r in rows if r["provider_id"] not in blocked]
+
+    return _entries(db, rows)
+
+
+def _entries(db: Session, rows: List[Any]) -> List[Dict[str, Any]]:
+    """Turn view rows into call-ready entries. Shared by _build and combo routing."""
+    key_ids = {r["provider_key_id"] for r in rows}
+    plaintext: Dict[int, str] = {}
+    if key_ids:
+        for pk in db.query(ProviderKey).filter(ProviderKey.id.in_(key_ids)):
+            plaintext[pk.id] = crypto.decrypt(pk.key_ciphertext)
+
+    providers_by_id = {p.id: p for p in db.query(Provider)}
+    bases = {
+        pid: presets.call_api_base(p.slug, p.base_url)
+        for pid, p in providers_by_id.items()
+    }
+    ds_web_prefix = f"{deepseek_web.PROVIDER_SLUG}/"
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        if r["litellm_model"].startswith("nvcf/"):
+            continue
+        if r["litellm_model"].startswith(ds_web_prefix):
+            continue
+        if r["provider_key_id"] not in plaintext:
+            continue
+        if nvidia_riva.is_riva_model(r["litellm_model"]):
+            model_id, function_id = nvidia_riva.split_function_id(r["litellm_model"])
+            params: Dict[str, Any] = {
+                "model": model_id,
+                "api_key": plaintext[r["provider_key_id"]],
+                "api_base": nvidia_riva.GRPC_ENDPOINT,
+                "nvcf_function_id": function_id,
+            }
+        else:
+            prov = providers_by_id.get(r["provider_id"])
+            slug = prov.slug if prov else None
+            params = {
+                "model": presets.call_model_id(slug, r["litellm_model"]),
+                "api_key": plaintext[r["provider_key_id"]],
+            }
+            custom_llm_provider = presets.custom_llm_provider_for(slug)
+            if custom_llm_provider:
+                params["custom_llm_provider"] = custom_llm_provider
+            base = bases.get(r["provider_id"])
+            if base:
+                params["api_base"] = base
+        if r["rpm"]:
+            params["rpm"] = r["rpm"]
+
+        prov = providers_by_id.get(r["provider_id"])
+        out.append({
+            "deployment_id": r["deployment_id"],
+            "model": r["model"],
+            "litellm_model": r["litellm_model"],
+            "provider_id": r["provider_id"],
+            "provider_slug": prov.slug if prov else None,
+            "provider_name": prov.name if prov else None,
+            "provider_key_id": r["provider_key_id"],
+            "mode": r["mode"],
+            "params": params,
+        })
+    return out
+
+
 def _build(db: Session, user_id: int) -> Tuple[Router, List[str]]:
     """
     Build a Router from this user's CALLABLE deployments.
@@ -110,73 +215,54 @@ def _build(db: Session, user_id: int) -> Tuple[Router, List[str]]:
         select(v_live_deployments).where(v_live_deployments.c.user_id == user_id)
     ).mappings().all()
 
+    # Layer 1 of the resilience model: drop providers whose circuit is OPEN.
+    # The view already excludes cooled-down KEYS (layer 2); this is the
+    # provider-wide signal it cannot express, because a provider being down is a
+    # fact about the provider rather than about anyone's key.
+    #
+    # HALF_OPEN providers are deliberately left IN: that state exists to let one
+    # request through and discover whether the provider recovered.
+    blocked = circuit_breaker.blocked_provider_ids(db)
+    if blocked:
+        before = len(rows)
+        rows = [r for r in rows if r["provider_id"] not in blocked]
+        logger.info(
+            "Circuit breaker removed %d deployment(s) across %d open provider(s).",
+            before - len(rows), len(blocked),
+        )
+
     router_kwargs, pinned_provider_id = _router_settings(db, user_id)
     rows = _apply_pin(rows, pinned_provider_id)
 
-    # Decrypt each key once, not once per deployment.
-    key_ids = {r["provider_key_id"] for r in rows}
-    plaintext: Dict[int, str] = {}
-    if key_ids:
-        for pk in db.query(ProviderKey).filter(ProviderKey.id.in_(key_ids)):
-            plaintext[pk.id] = crypto.decrypt(pk.key_ciphertext)
-
-    # base_url is what discovery calls; native-routing providers (Cohere) must
-    # NOT receive it as api_base on real calls — litellm knows their endpoint.
-    providers_by_id = {p.id: p for p in db.query(Provider)}
-    bases = {
-        pid: presets.call_api_base(p.slug, p.base_url)
-        for pid, p in providers_by_id.items()
-    }
-
-    model_list: List[Dict[str, Any]] = []
     # NVCF deployments (litellm_model 'nvcf/<id>') are served by the adapter in
     # services/nvcf.py, NEVER by litellm — the prefix means nothing to it and
     # could poison the whole Router build. They still count as callable models
     # (see `names` below) so /v1/models and resolution know about them.
     nvcf_rows = [r for r in rows if r["litellm_model"].startswith("nvcf/")]
-    for r in rows:
-        if r["litellm_model"].startswith("nvcf/"):
-            continue
-        if nvidia_riva.is_riva_model(r["litellm_model"]):
-            # NVIDIA Riva ASR — litellm speaks this protocol natively, but
-            # each function needs its own NVCF function id and the Riva gRPC
-            # endpoint rather than the provider's normal chat api_base (see
-            # services/nvidia_riva.py).
-            model_id, function_id = nvidia_riva.split_function_id(r["litellm_model"])
-            params: Dict[str, Any] = {
-                "model": model_id,
-                "api_key": plaintext[r["provider_key_id"]],
-                "api_base": nvidia_riva.GRPC_ENDPOINT,
-                "nvcf_function_id": function_id,
-            }
-        else:
-            slug = providers_by_id[r["provider_id"]].slug if r["provider_id"] in providers_by_id else None
-            params = {
-                "model": presets.call_model_id(slug, r["litellm_model"]),
-                "api_key": plaintext[r["provider_key_id"]],   # passed in, never os.environ
-            }
-            # Providers litellm has no native prefix for (LongCat) must be
-            # forced onto a specific integration — see
-            # presets.custom_llm_provider_for.
-            custom_llm_provider = presets.custom_llm_provider_for(slug)
-            if custom_llm_provider:
-                params["custom_llm_provider"] = custom_llm_provider
-            base = bases.get(r["provider_id"])
-            if base:
-                params["api_base"] = base
-        if r["rpm"]:
-            params["rpm"] = r["rpm"]
+    # Same exclusion, same reason, for browser-session providers: litellm has no
+    # 'deepseek-web' integration, so leaving these in the model_list makes the
+    # Router constructor raise "LLM Provider NOT provided" — which takes down
+    # EVERY model for that user, including GET /v1/models. They stay in `names`
+    # so they remain callable through the executor branch in openai_compat.
+    ds_web_prefix = f"{deepseek_web.PROVIDER_SLUG}/"
 
-        model_list.append({
+    # _entries decrypts each key once, applies the provider quirks (Riva
+    # endpoints, forced custom_llm_provider, api_base) and drops exactly the two
+    # families above. Combo routing reads the same entries — see
+    # callable_deployments.
+    model_list: List[Dict[str, Any]] = [
+        {
             # The client asks for the bare family name; litellm load-balances
             # every deployment registered under it — across BOTH keys and providers.
-            "model_name": r["model"],
-            "litellm_params": params,
+            "model_name": e["model"],
+            "litellm_params": e["params"],
             # Carry our deployment id through, so a failure can be attributed back
             # to the exact (model, key) row and written to the DB.
-            "model_info": {"id": str(r["deployment_id"]),
-                           "deployment_id": r["deployment_id"]},
-        })
+            "model_info": {"id": str(e["deployment_id"]),
+                           "deployment_id": e["deployment_id"]},
+        }
+        for e in _entries(db, rows)
+    ]
 
     litellm.request_timeout = settings.REQUEST_TIMEOUT
     router = Router(
@@ -184,8 +270,14 @@ def _build(db: Session, user_id: int) -> Tuple[Router, List[str]]:
         timeout=settings.REQUEST_TIMEOUT,
         **router_kwargs,
     )
+    # Deployments excluded from the Router above are still CALLABLE — just not by
+    # litellm. Leaving them out of `names` would hide them from /v1/models and
+    # make resolve_requested_model 404 a model the gateway can actually serve.
+    ds_web_rows = [r for r in rows if r["litellm_model"].startswith(ds_web_prefix)]
     names = sorted(
-        {d["model_name"] for d in model_list} | {r["model"] for r in nvcf_rows}
+        {d["model_name"] for d in model_list}
+        | {r["model"] for r in nvcf_rows}
+        | {r["model"] for r in ds_web_rows}
     )
     logger.info(
         "Router built for user %s: %d deployment(s) across %d model(s).",
@@ -232,6 +324,50 @@ def list_models(user_id: int, db: Optional[Session] = None) -> List[str]:
     return list(hit[2]) if hit else []
 
 
+def non_litellm_deployment(
+    user_id: int, normalized_name: str, db: Session, prefix: str
+) -> Optional[Tuple[str, str]]:
+    """
+    Resolve a family name to (litellm_model, decrypted key) for a provider that
+    litellm cannot serve — currently only DeepSeek Web.
+
+    Callers pass the NORMALIZED family name, which is what reaches the endpoint:
+    `deepseek-web/deepseek-chat` normalises to `deepseek-chat`, so matching on
+    the raw prefix at the endpoint would never fire.
+
+    Returns None unless EVERY live deployment for that name belongs to `prefix`.
+    That condition matters because the real DeepSeek API also serves a model
+    called `deepseek-chat`: when both are configured they share one family, and
+    litellm should keep handling it — falling back to the browser session would
+    silently downgrade a paid, rate-limit-free API call to a scraped web session.
+    The bypass is for the case where litellm has nothing to route to.
+
+    Reads the same v_live_deployments view the Router is built from, so key
+    isolation is identical — rows are already scoped to this user_id.
+    """
+    rows = db.execute(
+        select(
+            v_live_deployments.c.litellm_model,
+            v_live_deployments.c.provider_key_id,
+        ).where(
+            v_live_deployments.c.user_id == user_id,
+            # `model` IS the normalized family name in this view — the same value
+            # _build registers as litellm's `model_name`.
+            v_live_deployments.c.model == normalized_name,
+        )
+    ).mappings().all()
+    if not rows:
+        return None
+    if not all(str(r["litellm_model"]).startswith(f"{prefix}/") for r in rows):
+        return None
+
+    row = rows[0]
+    pk = db.query(ProviderKey).filter(ProviderKey.id == row["provider_key_id"]).first()
+    if not pk:
+        return None
+    return str(row["litellm_model"]), crypto.decrypt(pk.key_ciphertext)
+
+
 def record_failure(deployment_id: int, exc: Exception) -> None:
     """
     Write an in-flight failure back to Postgres.
@@ -251,10 +387,24 @@ def record_failure(deployment_id: int, exc: Exception) -> None:
         dep = db.query(Deployment).filter(Deployment.id == deployment_id).first()
         if not dep:
             return
+
+        # Health timeline (SRS §20), recorded before the status is overwritten.
+        # source='request' marks this as observed from real traffic rather than
+        # a probe — the two answer different questions.
+        health_history.record_transition(
+            db, dep, status, source="request", http_code=code, error=msg,
+        )
+
         dep.status = status
         dep.http_code = code
         dep.error = msg[:500]
         dep.last_checked_at = now
+
+        # Layer 1: only 408/5xx count as a PROVIDER fault. A 401 or 429 is
+        # account-level and is handled above, per key — feeding it to the
+        # circuit would let one user's exhausted quota bench the provider for
+        # everyone (services/circuit_breaker.py).
+        circuit_breaker.record_failure(db, dep.provider_id, code, msg)
         # 429s escalate: honour the provider's Retry-After when present, else
         # walk the per-deployment ladder (60s → 2m → 5m) on consecutive strikes.
         if status is ModelHealth.rate_limited:
@@ -282,9 +432,17 @@ def record_success(deployment_id: int) -> None:
             return
         now = datetime.now(timezone.utc)
         dep.last_used_at = now
+        # The provider just answered, so it is up.
+        circuit_breaker.record_success(db, dep.provider_id)
         # A success ends any 429 streak — the next throttle starts the ladder over.
         dep.rate_limit_strikes = 0
         if dep.status is not ModelHealth.available:
+            # A recovery is the most interesting event on the timeline: it is
+            # where "throttled" becomes "serving again". Recorded before the
+            # status is overwritten (SRS §20).
+            health_history.record_transition(
+                db, dep, ModelHealth.available, source="request",
+            )
             # It worked — whatever we thought was wrong isn't any more.
             dep.status = ModelHealth.available
             dep.cooldown_until = None

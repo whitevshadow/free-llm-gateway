@@ -1,0 +1,20 @@
+# The build runs `npm install` inside the image — a host node_modules (Windows
+# binaries, ~750 packages) would both bloat the context and shadow it.
+node_modules
+.next
+.build
+npm-debug.log*
+
+# Never bake host credentials into an image layer.
+.env
+.env.*
+!.env.example
+
+.git
+.gitignore
+Dockerfile
+.dockerignore
+README.md
+coverage
+test-results
+playwright-report

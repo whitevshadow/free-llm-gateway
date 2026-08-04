@@ -26,7 +26,7 @@ key management. See _dev_bypass_user().
 import secrets
 from typing import Optional
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import APIKeyHeader
 from sqlalchemy.orm import Session
 
@@ -123,17 +123,46 @@ def _resolve(token: Optional[str], db: Session, *, allow_bypass: bool) -> User:
     return user
 
 
+def _session_user(request: Request, db: Session) -> Optional[User]:
+    """
+    Resolve the dashboard's session cookie, if one was sent.
+
+    This is the browser's transport for the SAME credential a program sends as a
+    bearer token: the cookie was minted by /v1/auth/login in exchange for a
+    gateway key (see api/session_auth.py). Accepting it here is what lets the
+    whole existing /v1/me/* surface serve the dashboard without a parallel set
+    of session-only endpoints.
+
+    Header credentials are checked FIRST by the callers below, so an explicit
+    Authorization header always wins over an ambient cookie — otherwise a stale
+    logged-in session in the same browser would silently override the key an API
+    client meant to use.
+    """
+    from app.api.session_auth import session_user  # local: circular import
+
+    return session_user(request, db)
+
+
 def current_user(
+    request: Request,
     authorization: Optional[str] = Depends(bearer_scheme),
     x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
     db: Session = Depends(get_db),
 ) -> User:
-    """Any authenticated user. Honours the dev bypass on chat routes."""
+    """Any authenticated user, via header token or dashboard session cookie."""
     token = _extract_token(authorization, x_api_key)
-    return _resolve(token, db, allow_bypass=True)
+    if token:
+        return _resolve(token, db, allow_bypass=True)
+
+    user = _session_user(request, db)
+    if user:
+        return user
+
+    return _resolve(None, db, allow_bypass=True)
 
 
 def require_admin(
+    request: Request,
     authorization: Optional[str] = Depends(bearer_scheme),
     x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
     db: Session = Depends(get_db),
@@ -145,9 +174,19 @@ def require_admin(
     Deliberately does NOT depend on current_user: it re-resolves with
     allow_bypass=False, so a REAL admin key is required even when
     REQUIRE_GATEWAY_AUTH is off.
+
+    A dashboard session is accepted here too, but only because it could only
+    have been minted by presenting a real gateway key at /v1/auth/login — the
+    dev bypass never issues one. The is_admin check below is unchanged and still
+    decides.
     """
     token = _extract_token(authorization, x_api_key)
-    user = _resolve(token, db, allow_bypass=False)
+    if token:
+        user = _resolve(token, db, allow_bypass=False)
+    else:
+        user = _session_user(request, db)
+        if not user:
+            raise _unauthorized("Missing API key.")
     if not user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

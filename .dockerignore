@@ -8,12 +8,16 @@
 !.env.example
 !**/.env.example
 
-# Frontend: node_modules is huge and the image rebuilds it anyway.
-frontend/node_modules
-frontend/dist
+# The API image no longer builds or serves a UI — the dashboard is its own image
+# (frontend/Dockerfile). Excluding the whole directory keeps ~2,100 source files
+# and a 750-package node_modules out of this build context entirely.
+frontend
 
-# The SPA is compiled INSIDE the image by the node stage. A stale local build
-# copied in would silently shadow it.
+# The upstream OmniRoute checkout, kept for reference. 10,000+ files that belong
+# in no image.
+OmniRoute
+
+# A stale local build would silently shadow what the image expects.
 backend/static
 
 # Python noise

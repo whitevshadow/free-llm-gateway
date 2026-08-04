@@ -1,37 +1,82 @@
 # syntax=docker/dockerfile:1
 # ─────────────────────────────────────────────────────────────────────────────
-#  Frontend — the React SPA, served by nginx, which also proxies the API.
+#  OmniRoute dashboard — the gateway's UI.
 #
-#  Build context is frontend/.   docker compose build web
+#  A Next.js server, not a static bundle: pages are server-rendered on demand and
+#  the `/api/*` bridge (src/app/api/[...path]/route.ts) runs server-side so it can
+#  reach the gateway on a container-internal address the browser never sees.
+#
+#  Build context is THIS directory (frontend/).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Stage 1: compile the SPA ────────────────────────────────────────────────
-FROM node:20-alpine AS build
-
+# ── Stage 1: dependencies ────────────────────────────────────────────────────
+FROM node:22-alpine AS deps
 WORKDIR /build
 
-# Manifests first, so `npm install` stays cached until deps actually change.
-COPY package.json package-lock.json* ./
-RUN npm install --no-audit --no-fund
+# Native toolchain: a handful of transitive packages ship node-gyp builds. The
+# modules this project actually aliases away (better-sqlite3, keytar, …) never
+# compile, but their siblings still need a compiler present to install cleanly.
+RUN apk add --no-cache libc6-compat python3 make g++
 
+COPY package.json package-lock.json* ./
+# --legacy-peer-deps: the upstream tree is resolved by pnpm, and several React 19
+# peer ranges have not caught up. npm's strict resolver rejects the tree outright.
+RUN npm install --no-audit --no-fund --legacy-peer-deps
+
+
+# ── Stage 2: build ───────────────────────────────────────────────────────────
+FROM node:22-alpine AS builder
+WORKDIR /build
+
+COPY --from=deps /build/node_modules ./node_modules
 COPY . .
 
-# vite.config.ts writes to ../backend/static (the single-image layout). In this
-# container that resolves to /backend/static — outside WORKDIR, which is fine;
-# we just copy from there in the next stage.
+# The address OpenAI/Anthropic clients point at — the gateway, not this
+# dashboard. Shown on the Endpoints screen and in every copy-paste snippet.
+#
+# NEXT_PUBLIC_* is INLINED AT BUILD TIME by Next, so this has to be a build arg:
+# setting it only at runtime would leave the compiled bundle advertising the
+# wrong port. Changing the gateway's port therefore needs a dashboard rebuild.
+ARG NEXT_PUBLIC_BASE_URL=http://localhost:8000
+ENV NEXT_PUBLIC_BASE_URL=${NEXT_PUBLIC_BASE_URL}
+
+# The dashboard imports a large share of OmniRoute's original module graph, and
+# the default heap is not enough to finish the production pass.
+ENV NODE_OPTIONS=--max-old-space-size=8192
+ENV NEXT_TELEMETRY_DISABLED=1
+
 RUN npm run build
 
 
-# ── Stage 2: nginx ──────────────────────────────────────────────────────────
-FROM nginx:1.27-alpine AS runtime
+# ── Stage 3: runtime ─────────────────────────────────────────────────────────
+FROM node:22-alpine AS runtime
+WORKDIR /app
 
-# Replace the default site with ours (SPA fallback + API proxy).
-RUN rm -f /etc/nginx/conf.d/default.conf
-COPY nginx.conf /etc/nginx/conf.d/gateway.conf
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
 
-COPY --from=build /backend/static /usr/share/nginx/html
+# `output: "standalone"` emits a self-contained server plus only the node_modules
+# it actually traced — the difference between a ~200 MB image and a ~2 GB one.
+# static/ and public/ are not included in that trace and must be copied beside it.
+COPY --from=builder /build/.next/standalone ./
+COPY --from=builder /build/.next/static ./.next/static
+COPY --from=builder /build/public ./public
 
-EXPOSE 80
+# Non-root. The dashboard holds session cookies in flight and has no reason to
+# own its own filesystem.
+RUN addgroup --system --gid 10002 nodejs \
+    && adduser --system --uid 10002 --ingroup nodejs nextjs \
+    && chown -R nextjs:nodejs /app
+USER nextjs
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD wget -q --spider http://localhost/ || exit 1
+EXPOSE 3000
+
+# Hits the bridge's own liveness path, which in turn pings the gateway — so an
+# unhealthy backend surfaces here instead of a dashboard that loads and then
+# fails on every request.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD wget -qO- http://127.0.0.1:3000/api/health/ping >/dev/null || exit 1
+
+CMD ["node", "server.js"]

@@ -40,6 +40,8 @@ from app.models.user import User
 from app.models.views import v_live_deployments
 from app.services import crypto
 from app.services import nvcf as nvcf_svc
+from app.services import deepseek_web
+from app.services import combo_router
 from app.services.normalize import resolve_requested_model
 from app.services.usage_logger import log_v1_usage
 
@@ -86,13 +88,143 @@ async def list_models(user: User = Depends(current_user), db: Session = Depends(
     call anything.
     """
     now = int(time.time())
-    return {
-        "object": "list",
-        "data": [
-            {"id": name, "object": "model", "created": now, "owned_by": "gateway"}
-            for name in router_svc.list_models(user.id, db)
-        ],
+    names = router_svc.list_models(user.id, db)
+
+    # Modality per public model name, so a caller can tell a chat model from an
+    # embedding or TTS one without calling each to find out. `type`/`subtype` are
+    # NON-STANDARD additions: OpenAI's schema has no modality field, and clients
+    # ignore unknown keys, so this stays compatible while making the list useful.
+    #
+    # A name can be served by several deployments (that is the point of the
+    # gateway), so the mode is taken from the models behind the name — they share
+    # a normalized name only when they are interchangeable, which means they
+    # share a mode too.
+    from app.models.provider_model import ProviderModel
+
+    modes = dict(
+        db.query(ProviderModel.normalized_name, ProviderModel.mode)
+        .filter(ProviderModel.normalized_name.in_(names))
+        .distinct()
+        .all()
+    )
+
+    # Mapped to the vocabulary OpenAI-compatible tooling expects, not our enum's.
+    TYPE_BY_MODE = {
+        "embedding": ("embedding", None),
+        "image": ("image", None),
+        "audio_transcription": ("audio", "transcription"),
+        "audio_speech": ("audio", "speech"),
     }
+
+    data = []
+    for name in names:
+        mode = modes.get(name)
+        mode_value = mode.value if hasattr(mode, "value") else mode
+        # Chat is the default and carries NO type field — that absence is what
+        # marks a model as a plain chat model to OpenAI-compatible clients.
+        type_, subtype = TYPE_BY_MODE.get(mode_value or "", (None, None))
+        entry = {"id": name, "object": "model", "created": now, "owned_by": "gateway"}
+        if type_:
+            entry["type"] = type_
+        if subtype:
+            entry["subtype"] = subtype
+        data.append(entry)
+
+    # Combos are callable model names too (see _serve_combo), so a client that
+    # populates its model picker from this list can select one. Only combos with
+    # a live target are listed — same rule as everything else here. Marked by
+    # owned_by so tooling can tell a routing chain from a real model.
+    for combo_name in combo_router.callable_combo_names(db, user.id):
+        data.append({
+            "id": combo_name, "object": "model", "created": now,
+            "owned_by": "gateway-combo",
+        })
+
+    return {"object": "list", "data": data}
+
+
+async def _serve_combo(
+    user: User,
+    db: Session,
+    combo: Any,
+    body: Dict[str, Any],
+    stream: bool,
+):
+    """
+    Serve a request addressed to a COMBO name.
+
+    The combo engine (services/combo_router.py) orders the combo's targets by its
+    strategy and walks them until one answers, so everything below is about the
+    envelope: OpenAI-shaped streaming, and a usage row that records WHICH combo
+    served the call and at which attempt.
+
+    Streaming is deliberately non-resumable: once bytes are on the wire the
+    fallback chain is over, because a client that already received half an answer
+    cannot be handed a different model's continuation. Fallback therefore happens
+    entirely BEFORE the first chunk — combo_router only returns once a target has
+    accepted the request.
+    """
+    start = time.perf_counter()
+    requested = body.get("model")
+
+    try:
+        response, attempt, attempt_number = await combo_router.acompletion(
+            db, user.id, combo, body, stream=stream,
+        )
+    except combo_router.ComboError as exc:
+        log_v1_usage(
+            user_id=user.id, requested_model=requested or combo.name,
+            latency=round(time.perf_counter() - start, 3),
+            status_code=exc.status, error_message=exc.message,
+            combo_name=combo.name,
+        )
+        raise HTTPException(status_code=exc.status, detail=exc.message)
+
+    if stream:
+        async def combo_stream():
+            try:
+                async for chunk in response:
+                    yield f"data: {json.dumps(_to_dict(chunk))}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                logger.warning(
+                    "combo %r stream error (user %s): %s", combo.name, user.id, exc,
+                )
+                err = {"error": {"message": str(exc), "type": "gateway_error"}}
+                yield f"data: {json.dumps(err)}\n\n"
+                yield "data: [DONE]\n\n"
+
+        # Usage is logged up front for streams: token counts are not known until
+        # the stream ends, and a row written only on completion would lose every
+        # request whose client disconnected mid-answer.
+        log_v1_usage(
+            user_id=user.id, requested_model=requested or combo.name,
+            answered_deploy_id=attempt.deployment_id,
+            latency=round(time.perf_counter() - start, 3), status_code=200,
+            combo_name=combo.name, combo_attempt=attempt_number,
+        )
+        return StreamingResponse(combo_stream(), media_type="text/event-stream")
+
+    result = _to_dict(response)
+    log_v1_usage(
+        user_id=user.id,
+        requested_model=requested or combo.name,
+        answered_deploy_id=attempt.deployment_id,
+        usage=result.get("usage"),
+        latency=round(time.perf_counter() - start, 3),
+        status_code=200,
+        combo_name=combo.name,
+        combo_attempt=attempt_number,
+    )
+    # Non-standard, and useful: which target actually answered, and whether the
+    # chain had to fall back to reach it. Clients ignore unknown keys.
+    result["gateway_combo"] = {
+        "name": combo.name,
+        "strategy": combo.strategy,
+        "target": attempt.target.describe(),
+        "attempt": attempt_number,
+    }
+    return result
 
 
 @router.post("/v1/chat/completions")
@@ -111,6 +243,17 @@ async def chat_completions(
         raise HTTPException(status_code=400, detail="'messages' is required.")
 
     requested = body.get("model")
+
+    # ── combos come FIRST ────────────────────────────────────────────────────
+    # A combo name IS a model name to the client, and it must win over model
+    # resolution: `resolve_requested_model` fuzzy-matches, so a combo called
+    # "gpt-oss" could otherwise be silently served by the model gpt-oss-120b —
+    # ignoring the ordering and account pinning that is the whole point of
+    # having made the combo. Looked up exactly, by name, before anything else.
+    combo = combo_router.get_combo(db, user.id, requested or "")
+    if combo:
+        return await _serve_combo(user, db, combo, body, stream=bool(body.get("stream", False)))
+
     available = router_svc.list_models(user.id, db)
     if not available:
         raise HTTPException(
@@ -126,8 +269,53 @@ async def chat_completions(
     body["model"] = resolved
 
     stream = bool(body.pop("stream", False))
-    lr = router_svc.get_router(user.id, db)
     start = time.perf_counter()
+
+    # ── browser-session providers bypass litellm entirely ────────────────────
+    # DeepSeek Web is not an OpenAI-compatible endpoint: it needs a per-request
+    # proof-of-work and speaks a private SSE dialect, so litellm cannot carry it.
+    # Branching here (rather than inside the router) keeps the surrounding
+    # contract intact — the executor returns OpenAI-shaped objects, so logging,
+    # streaming and error handling below are unchanged.
+    ds_web = router_svc.non_litellm_deployment(
+        user.id, resolved, db, deepseek_web.PROVIDER_SLUG
+    )
+    if ds_web:
+        litellm_model, token = ds_web
+        client = deepseek_web.DeepSeekWebClient(token)
+        model_id = deepseek_web.strip_prefix(litellm_model)
+        call_body = {k: v for k, v in body.items() if k not in ("model", "messages")}
+
+        if stream:
+            async def ds_stream():
+                try:
+                    async for chunk in client.stream_chat(body["messages"], model_id, call_body):
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                except Exception as exc:
+                    logger.warning("deepseek-web stream error (user %s): %s", user.id, exc)
+                    err = {"error": {"message": str(exc), "type": "gateway_error"}}
+                    yield f"data: {json.dumps(err)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+            return StreamingResponse(ds_stream(), media_type="text/event-stream")
+
+        try:
+            result = await client.complete(body["messages"], model_id, call_body)
+        except deepseek_web.DeepSeekWebError as exc:
+            log_v1_usage(
+                user_id=user.id, requested_model=requested,
+                latency=round(time.perf_counter() - start, 3),
+                status_code=exc.status, error_message=str(exc),
+            )
+            raise HTTPException(status_code=exc.status, detail=str(exc))
+        log_v1_usage(
+            user_id=user.id, requested_model=requested,
+            latency=round(time.perf_counter() - start, 3), status_code=200,
+        )
+        return result
+
+    lr = router_svc.get_router(user.id, db)
 
     if stream:
         async def event_stream():

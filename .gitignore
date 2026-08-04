@@ -15,6 +15,7 @@ env/
 
 # NodeJS / Frontend
 node_modules/
+/OmniRoute/
 dist/
 dist-ssr/
 *.local
@@ -47,3 +48,4 @@ provider-keys-secret.csv
 .agents/
 skills-lock.json
 .gstack/
+

@@ -72,6 +72,108 @@ def get_db():
 # in-place changes only; anything structural (new tables, triggers, backfills)
 # means it is time for Alembic.
 MIGRATIONS = [
+    # ⚠ DEVIATION from the "additive, in-place only" rule above: this is a new
+    # TABLE, which the note says means it is time for Alembic. It is here anyway
+    # because it is purely additive (nothing reads or writes it except the
+    # health timeline), CREATE TABLE IF NOT EXISTS is idempotent, and there is no
+    # backfill — history starts accumulating from the first transition after
+    # deploy. If a SECOND structural change is needed, stop and set up Alembic
+    # rather than growing this list.
+    #
+    # Health timeline (SRS §20): `deployments.status` is overwritten in place, so
+    # a recovered key leaves no evidence it was ever throttled. Transitions only.
+    """
+    CREATE TABLE IF NOT EXISTS deployment_status_events (
+        id              BIGSERIAL PRIMARY KEY,
+        deployment_id   BIGINT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+        user_id         BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        from_status     model_health,
+        to_status       model_health NOT NULL,
+        source          VARCHAR(24) NOT NULL DEFAULT 'probe',
+        http_code       INTEGER,
+        latency_ms      INTEGER,
+        error           TEXT,
+        cooldown_until  TIMESTAMPTZ,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_dse_user_created "
+    "ON deployment_status_events (user_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_dse_deployment_created "
+    "ON deployment_status_events (deployment_id, created_at DESC)",
+
+    # Per-user dashboard preferences (models/user_setting.py). Additive and
+    # idempotent, same reasoning as the table above. NOTHING the router reads
+    # lives here — routing settings stay typed in router_config.
+    """
+    CREATE TABLE IF NOT EXISTS user_settings (
+        id          BIGSERIAL PRIMARY KEY,
+        user_id     BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        key         VARCHAR(160) NOT NULL,
+        value       JSONB NOT NULL,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT uq_user_settings_user_key UNIQUE (user_id, key)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_user_settings_user ON user_settings (user_id)",
+
+    # Provider circuit breakers — layer 1 of the resilience model (SRS §14),
+    # ported from OmniRoute's RESILIENCE_GUIDE. GLOBAL, not per-user: a 502 is a
+    # fact about the provider, true for everyone at once. Only 408/5xx may trip
+    # it; account-level 401/429 stay on the per-key path.
+    """
+    CREATE TABLE IF NOT EXISTS provider_circuits (
+        id                BIGSERIAL PRIMARY KEY,
+        provider_id       BIGINT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+        state             VARCHAR(16) NOT NULL DEFAULT 'closed',
+        failure_count     INTEGER NOT NULL DEFAULT 0,
+        opened_until      TIMESTAMPTZ,
+        last_status_code  INTEGER,
+        last_error        TEXT,
+        last_failure_at   TIMESTAMPTZ,
+        last_success_at   TIMESTAMPTZ,
+        open_count        INTEGER NOT NULL DEFAULT 0,
+        created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT uq_provider_circuits_provider UNIQUE (provider_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_provider_circuits_state ON provider_circuits (state)",
+
+    # Combos (models/combo.py): named, ordered routing chains addressable as a
+    # model name. Same additive/idempotent reasoning as the tables above — the
+    # canonical definition lives in schema.sql; this is the path for databases
+    # that already exist.
+    """
+    CREATE TABLE IF NOT EXISTS combos (
+        id           BIGSERIAL PRIMARY KEY,
+        user_id      BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name         VARCHAR(120) NOT NULL,
+        description  TEXT,
+        strategy     VARCHAR(48) NOT NULL DEFAULT 'priority',
+        models       JSONB NOT NULL DEFAULT '[]'::jsonb,
+        config       JSONB NOT NULL DEFAULT '{}'::jsonb,
+        is_active    BOOLEAN NOT NULL DEFAULT true,
+        is_hidden    BOOLEAN NOT NULL DEFAULT false,
+        sort_order   INTEGER NOT NULL DEFAULT 0,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT uq_combos_user_name UNIQUE (user_id, name)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_combos_user_sort ON combos (user_id, sort_order)",
+
+    # Combo attribution on the usage ledger. Without these, a call made through a
+    # combo is indistinguishable from a direct model call, so the dashboard's
+    # per-combo success/fallback rates would have to be invented. `combo_attempt`
+    # is the 1-based position of the target that ANSWERED: > 1 means the combo
+    # fell back, which is exactly the "fallbackRate" the UI shows.
+    "ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS combo_name VARCHAR(120)",
+    "ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS combo_attempt INTEGER",
+    "CREATE INDEX IF NOT EXISTS ix_logs_combo "
+    "ON request_logs (user_id, combo_name, created_at DESC)",
+
     # Escalating 429 cooldowns (SRS §7.3): consecutive-429 counter per deployment.
     "ALTER TABLE deployments "
     "ADD COLUMN IF NOT EXISTS rate_limit_strikes INTEGER NOT NULL DEFAULT 0",

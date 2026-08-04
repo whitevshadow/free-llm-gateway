@@ -88,6 +88,20 @@ class Settings(BaseSettings):
     # works out of the box; override it in .env for any real deployment.
     MASTER_ADMIN_KEY: Optional[str] = DEFAULT_MASTER_ADMIN_KEY
 
+    # ── Dashboard session (api/session_auth.py) ─────────
+    # The browser dashboard trades a gateway key for a signed, httpOnly session
+    # cookie so the key itself never sits in localStorage. Sessions are stateless
+    # (a signed JWT, no server-side store), so there is no revocation list — a
+    # session outlives the revocation of the key that created it, for up to this
+    # long. Keep it short; hours, not weeks.
+    SESSION_TTL_HOURS: int = 12
+
+    # Set the Secure flag on the session cookie. Must stay false for plain-HTTP
+    # localhost development — a Secure cookie is silently dropped by the browser
+    # over http://, which presents as "login succeeds but I'm still logged out".
+    # Turn it on for any deployment served over TLS.
+    SESSION_COOKIE_SECURE: bool = False
+
     # ── CORS ────────────────────────────────────────────
     CORS_ORIGINS: str = "*"            # comma-separated; "*" is dev-only
 

@@ -46,6 +46,17 @@ from app.models.deployment import Deployment
 # ── Ledger + router behaviour ───────────────────────────────────────────────
 from app.models.request_log import RequestLog
 from app.models.router_config import RouterConfig
+# Append-only health transitions, backing the dashboard's health timeline
+# (SRS §20). Written only when a deployment's status actually changes.
+from app.models.deployment_status_event import DeploymentStatusEvent
+# Per-user dashboard preferences. Deliberately NOT routing settings — those
+# stay typed in router_config (see the model's docstring).
+from app.models.user_setting import UserSetting
+# Provider-level circuit breaker (SRS §14). Global by design — see the model.
+from app.models.provider_circuit import ProviderCircuit
+# Named, ordered routing chains addressable as a model name (OMNIROUTE Phase 1).
+# Orthogonal to RouterConfig: that tunes the pool, this defines a candidate list.
+from app.models.combo import Combo
 
 # ── Read-only views ─────────────────────────────────────────────────────────
 from app.models.views import v_my_models, v_live_deployments
@@ -62,6 +73,10 @@ __all__ = [
     "Deployment",
     "RequestLog",
     "RouterConfig",
+    "DeploymentStatusEvent",
+    "UserSetting",
+    "ProviderCircuit",
+    "Combo",
     "v_my_models",
     "v_live_deployments",
 ]
